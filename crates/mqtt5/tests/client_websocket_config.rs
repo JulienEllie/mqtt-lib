@@ -10,6 +10,7 @@
 mod wss_test_server;
 
 use futures::{SinkExt, StreamExt};
+use mqtt5::error::MqttError;
 use mqtt5::time::Duration;
 use mqtt5::transport::websocket::WebSocketConfig;
 use mqtt5::{ConnectOptions, MqttClient};
@@ -167,6 +168,102 @@ async fn websocket_config_is_not_sent_to_a_redirect_target() {
     assert_eq!(header(&target, "Authorization"), None);
 
     let _ = client.disconnect().await;
+}
+
+#[tokio::test]
+async fn request_modifier_runs_again_on_reconnect() {
+    let (url, mut requests) = closing_mqtt_server(CONNACK.to_vec()).await;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&calls);
+    let websocket = WebSocketConfig::new("ws://placeholder.invalid/mqtt")
+        .expect("config")
+        .with_request_modifier(move |mut request| {
+            let call = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            async move {
+                request
+                    .headers_mut()
+                    .insert("x-token", format!("token-{call}").parse()?);
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(request)
+            }
+        });
+    let options = ConnectOptions::new("ws-modifier-client")
+        .with_websocket_config(websocket)
+        .with_reconnect_delay(Duration::from_millis(100), Duration::from_millis(500));
+    let client = MqttClient::with_options(options);
+
+    timeout(WAIT, client.connect(&url))
+        .await
+        .expect("connect timed out")
+        .expect("connect");
+
+    for (attempt, token) in [("connect", "token-1"), ("reconnect", "token-2")] {
+        let headers = timeout(WAIT, requests.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no upgrade request for the {attempt}"))
+            .expect("server stopped");
+        assert_eq!(header(&headers, "x-token"), Some(token), "{attempt}");
+    }
+
+    let _ = client.disconnect().await;
+}
+
+#[tokio::test]
+async fn request_modifier_can_point_a_placeholder_host_at_the_broker() {
+    let (url, mut requests) = closing_mqtt_server(CONNACK.to_vec()).await;
+    let broker: tokio_tungstenite::tungstenite::http::Uri = url.parse().expect("broker uri");
+    let websocket = WebSocketConfig::new("ws://placeholder.invalid/mqtt")
+        .expect("config")
+        .with_request_modifier(move |mut request| {
+            let broker = broker.clone();
+            async move {
+                let host = broker.authority().expect("authority").as_str().parse()?;
+                request.headers_mut().insert("host", host);
+                *request.uri_mut() = broker;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(request)
+            }
+        });
+    let client = MqttClient::with_options(
+        ConnectOptions::new("ws-placeholder-client")
+            .with_websocket_config(websocket)
+            .with_automatic_reconnect(false),
+    );
+
+    timeout(WAIT, client.connect("ws://placeholder.invalid/mqtt"))
+        .await
+        .expect("connect timed out")
+        .expect("connect");
+    let headers = timeout(WAIT, requests.recv())
+        .await
+        .expect("no upgrade request")
+        .expect("server stopped");
+    assert_eq!(
+        header(&headers, "host"),
+        url.strip_prefix("ws://")
+            .and_then(|rest| rest.strip_suffix("/mqtt"))
+    );
+
+    let _ = client.disconnect().await;
+}
+
+#[tokio::test]
+async fn client_reports_a_rejected_websocket_config_as_a_configuration_error() {
+    let websocket = WebSocketConfig::new("ws://127.0.0.1:9/mqtt")
+        .expect("config")
+        .with_header("Content-Length", "5");
+    let client = MqttClient::with_options(
+        ConnectOptions::new("ws-rejected-config-client")
+            .with_websocket_config(websocket)
+            .with_automatic_reconnect(false),
+    );
+
+    let err = timeout(WAIT, client.connect("ws://127.0.0.1:9/mqtt"))
+        .await
+        .expect("connect timed out")
+        .expect_err("connect accepted a reserved header");
+    assert!(
+        matches!(err, MqttError::Configuration(_)),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[tokio::test]
