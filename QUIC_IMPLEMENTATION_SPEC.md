@@ -283,9 +283,11 @@ graph TD
 
 #### Broker Connection Handling
 
-The broker spawns three concurrent tasks per QUIC connection: a **client handler** that processes packets from the control stream, a **datagram reader** that decodes unreliable datagrams and forwards them via mpsc channel, and a **data stream acceptor** that accepts unidirectional streams and spawns per-stream readers with flow header parsing.
+The broker spawns these concurrent tasks per QUIC connection: a **client handler** that processes packets from the control stream, a **datagram reader** that decodes unreliable datagrams and forwards them via mpsc channel, a **unidirectional stream acceptor** that spawns per-stream readers with flow header parsing, and a **bidirectional stream acceptor** for client data flows and flow discards.
 
-Data stream readers detect flow headers by inspecting the first byte (0x11-0x13) and register flows in a per-connection `FlowRegistry`.
+Data stream readers detect flow headers by inspecting the first byte (0x11-0x14) and register flows in a per-connection `FlowRegistry`.
+
+A client data flow on a bidirectional stream is served on that stream: the broker's answers to the flow's packets and the deliveries for its subscriptions go back on it. A newer stream for the same flow takes it over and the older one is reset. While the flow has no stream, its QoS 1/2 deliveries wait for the next one, up to the client's Receive Maximum. A flow header followed directly by FIN discards the flow. The design is modelled in `specs/tla/bidi-client-flow`.
 
 ### Internal Types
 
@@ -393,3 +395,7 @@ The project uses Quinn 0.11.x. Both client and broker set ALPN to `mqtt`.
 **Connection migration (`quic_migration_tests.rs`):**
 - test_quic_migration_detected_by_server, test_quic_migration_qos1_survives
 - test_quic_multiple_migrations, test_migrate_non_quic_returns_error, test_migrate_not_connected_returns_error
+
+**Broker flow streams (`quic_flow_streams.rs`):**
+- refused streams and their error codes, flow discards
+- bidirectional client data flows: answers and deliveries on the flow's stream, takeover, late older streams, messages waiting for a new stream, FIN, incomplete packets, retained messages

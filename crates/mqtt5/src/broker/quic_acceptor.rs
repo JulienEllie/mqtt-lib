@@ -1,5 +1,5 @@
 use crate::broker::auth::AuthProvider;
-use crate::broker::client_handler::ClientHandler;
+use crate::broker::client_handler::{BidiFlowEvent, ClientHandler, OpenedStream, StreamEnding};
 use crate::broker::config::BrokerConfig;
 use crate::broker::resource_monitor::ResourceMonitor;
 use crate::broker::router::MessageRouter;
@@ -567,6 +567,7 @@ async fn run_quic_handler_inner(
     let (packet_tx, packet_rx) = mpsc::channel::<(Packet, Option<u64>)>(100);
     let (flow_closed_tx, flow_closed_rx) = mpsc::channel::<u64>(32);
     let (flow_discard_tx, flow_discard_rx) = mpsc::channel(32);
+    let (bidi_flow_tx, bidi_flow_rx) = mpsc::channel(100);
     let flow_registry = Arc::new(Mutex::new(FlowRegistry::new(256)));
     let (protocol_version_tx, protocol_version_rx) = watch::channel(None);
 
@@ -608,6 +609,7 @@ async fn run_quic_handler_inner(
     .with_skip_bridge_forwarding(skip_bridge_forwarding)
     .with_flow_closed_rx(flow_closed_rx)
     .with_flow_discard_rx(flow_discard_rx)
+    .with_bidi_flow_rx(bidi_flow_rx)
     .with_flow_registry(flow_registry.clone());
 
     let handler_label = label;
@@ -633,10 +635,14 @@ async fn run_quic_handler_inner(
         label,
     );
     spawn_bi_accept_loop(
-        connection.clone(),
-        flow_registry.clone(),
-        flow_discard_tx,
-        peer_addr,
+        BidiStreamContext {
+            connection: connection.clone(),
+            peer_addr,
+            flow_registry: flow_registry.clone(),
+            flow_discard_tx,
+            bidi_flow_tx,
+            protocol_version_rx: protocol_version_rx.clone(),
+        },
         label,
     );
     spawn_quic_stats_sampler(connection.clone(), peer_addr);
@@ -764,25 +770,24 @@ fn spawn_datagram_reader(
     });
 }
 
-fn spawn_bi_accept_loop(
+#[derive(Clone)]
+struct BidiStreamContext {
     connection: Arc<Connection>,
+    peer_addr: SocketAddr,
     flow_registry: Arc<Mutex<FlowRegistry>>,
     flow_discard_tx: mpsc::Sender<(u64, oneshot::Sender<()>)>,
-    peer_addr: SocketAddr,
-    label: &'static str,
-) {
+    bidi_flow_tx: mpsc::Sender<BidiFlowEvent>,
+    protocol_version_rx: watch::Receiver<Option<u8>>,
+}
+
+fn spawn_bi_accept_loop(context: BidiStreamContext, label: &'static str) {
     tokio::spawn(async move {
+        let peer_addr = context.peer_addr;
         loop {
-            match connection.accept_bi().await {
+            match context.connection.accept_bi().await {
                 Ok((send, recv)) => {
                     debug!("{} bidirectional stream accepted from {}", label, peer_addr);
-                    spawn_bi_stream_handler(
-                        send,
-                        recv,
-                        peer_addr,
-                        flow_registry.clone(),
-                        flow_discard_tx.clone(),
-                    );
+                    spawn_bi_stream_handler(send, recv, context.clone());
                 }
                 Err(e) => {
                     let reason = crate::transport::quic_error::parse_connection_error(&e);
@@ -864,18 +869,19 @@ fn refuse_stream(
     }
 }
 
-async fn ends_after_header(recv: &mut RecvStream) -> bool {
-    matches!(recv.read_chunk(1, true).await, Ok(None))
+async fn chunk_after_header(recv: &mut RecvStream) -> Option<Option<Bytes>> {
+    match recv.read_chunk(usize::MAX, true).await {
+        Ok(chunk) => Some(chunk.map(|chunk| chunk.bytes)),
+        Err(e) => {
+            debug!("stream ended before its first packet: {e}");
+            None
+        }
+    }
 }
 
-fn spawn_bi_stream_handler(
-    mut send: SendStream,
-    mut recv: RecvStream,
-    peer_addr: SocketAddr,
-    flow_registry: Arc<Mutex<FlowRegistry>>,
-    flow_discard_tx: mpsc::Sender<(u64, oneshot::Sender<()>)>,
-) {
+fn spawn_bi_stream_handler(mut send: SendStream, mut recv: RecvStream, context: BidiStreamContext) {
     tokio::spawn(async move {
+        let peer_addr = context.peer_addr;
         let result = match try_read_flow_header(&mut recv).await {
             Ok(StreamOpening::Flow(result)) => result,
             Ok(StreamOpening::Refused(code)) => {
@@ -893,34 +899,123 @@ fn spawn_bi_stream_handler(
             return;
         };
 
-        if !flags.is_discard_signal()
-            || !result.leftover.is_empty()
-            || !ends_after_header(&mut recv).await
-        {
-            refuse_stream(&mut send, &mut recv, peer_addr, QuicStreamCode::FlowRefused);
-            return;
-        }
+        let buffer = if flags.is_discard_signal() && result.leftover.is_empty() {
+            match chunk_after_header(&mut recv).await {
+                Some(Some(bytes)) => BytesMut::from(bytes.as_ref()),
+                Some(None) => {
+                    discard_flow(send, flow_id, &context).await;
+                    return;
+                }
+                None => return,
+            }
+        } else {
+            result.leftover
+        };
 
-        if let Some(state) = flow_registry.lock().await.remove(flow_id) {
-            debug!(flow_id = ?flow_id, "discarded flow state for {peer_addr}: {state:?}");
-        }
-
-        let (discarded_tx, discarded_rx) = oneshot::channel();
-        if flow_discard_tx
-            .send((flow_id.raw(), discarded_tx))
-            .await
-            .is_err()
-            || discarded_rx.await.is_err()
-        {
-            debug!(flow_id = ?flow_id, "client handler ended before the flow was discarded");
-        }
-
-        if let Err(e) = send.finish() {
-            debug!(flow_id = ?flow_id, "discard stream from {peer_addr} already closed: {e}");
-        }
-
-        debug!(flow_id = ?flow_id, "completed discard handshake for {peer_addr}");
+        let flow = FlowState::new_client_data(flow_id, flags, result.expire);
+        serve_bidi_flow(send, recv, flow, buffer, &context).await;
     });
+}
+
+async fn discard_flow(mut send: SendStream, flow_id: FlowId, context: &BidiStreamContext) {
+    let peer_addr = context.peer_addr;
+    if let Some(state) = context.flow_registry.lock().await.remove(flow_id) {
+        debug!(flow_id = ?flow_id, "discarded flow state for {peer_addr}: {state:?}");
+    }
+
+    let (discarded_tx, discarded_rx) = oneshot::channel();
+    if context
+        .flow_discard_tx
+        .send((flow_id.raw(), discarded_tx))
+        .await
+        .is_err()
+        || discarded_rx.await.is_err()
+    {
+        debug!(flow_id = ?flow_id, "client handler ended before the flow was discarded");
+    }
+
+    if let Err(e) = send.finish() {
+        debug!(flow_id = ?flow_id, "discard stream from {peer_addr} already closed: {e}");
+    }
+
+    debug!(flow_id = ?flow_id, "completed discard handshake for {peer_addr}");
+}
+
+async fn serve_bidi_flow(
+    send: SendStream,
+    mut recv: RecvStream,
+    flow: FlowState,
+    mut buffer: BytesMut,
+    context: &BidiStreamContext,
+) {
+    let peer_addr = context.peer_addr;
+    let Some(protocol_version) =
+        negotiated_protocol_version(context.protocol_version_rx.clone()).await
+    else {
+        debug!("client handler ended before CONNECT from {peer_addr}");
+        return;
+    };
+    let flow_id = flow.id.raw();
+    let stream_id = u64::from(recv.id());
+    let (abort_tx, mut abort_rx) = oneshot::channel();
+    let opened = OpenedStream {
+        flow,
+        stream_id,
+        send,
+        abort: abort_tx,
+    };
+    if context
+        .bidi_flow_tx
+        .send(BidiFlowEvent::Opened(Box::new(opened)))
+        .await
+        .is_err()
+    {
+        debug!(flow_id, "client handler ended before the flow opened");
+        return;
+    }
+
+    let ending = loop {
+        tokio::select! {
+            code = &mut abort_rx => {
+                let code = code.unwrap_or(QuicStreamCode::NoError);
+                if let Err(e) = recv.stop(quinn::VarInt::from_u32(code.code())) {
+                    debug!(flow_id, stream_id, "flow stream already closed before stop: {e}");
+                }
+                return;
+            }
+            read = read_packet_with_buffer(&mut recv, &mut buffer, protocol_version) => match read {
+                Ok(packet) => {
+                    let event = BidiFlowEvent::Packet { flow_id, stream_id, packet };
+                    if context.bidi_flow_tx.send(event).await.is_err() {
+                        debug!(flow_id, "client handler ended, stopping flow reader");
+                        return;
+                    }
+                }
+                Err(MqttError::ClientClosed) if buffer.is_empty() => break StreamEnding::Finished,
+                Err(MqttError::ClientClosed) => break StreamEnding::Incomplete,
+                Err(MqttError::ConnectionError(reason)) => {
+                    debug!(flow_id, stream_id, "flow stream from {peer_addr} ended: {reason}");
+                    break StreamEnding::Aborted;
+                }
+                Err(e) => {
+                    close_on_malformed_packet(&context.connection, peer_addr, "data flow", &e);
+                    return;
+                }
+            }
+        }
+    };
+
+    let closed = BidiFlowEvent::Closed {
+        flow_id,
+        stream_id,
+        ending,
+    };
+    if context.bidi_flow_tx.send(closed).await.is_err() {
+        debug!(
+            flow_id,
+            "client handler ended before the flow stream closed"
+        );
+    }
 }
 
 const CONTROL_FLOW_CLOSE_GRACE: Duration = Duration::from_secs(1);

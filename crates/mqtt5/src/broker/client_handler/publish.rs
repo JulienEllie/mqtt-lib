@@ -619,6 +619,11 @@ impl ClientHandler {
     }
 
     pub(super) async fn send_routable(&mut self, routable: RoutableMessage) -> Result<()> {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+        let Some(routable) = self.hold_for_flow(routable).await
+        else {
+            return Ok(());
+        };
         self.pending_target_flow = routable.target_flow;
         let result = self.send_publish(routable.publish).await;
         self.pending_target_flow = None;
@@ -776,6 +781,9 @@ impl ClientHandler {
 
         if self.quic_connection.is_some() {
             if let Some(flow_id) = self.pending_target_flow {
+                if self.is_bidi_flow(flow_id) {
+                    return self.write_buffer_to_flow(flow_id).await;
+                }
                 if self.server_stream_manager.is_none() {
                     self.server_stream_manager = Some(self.build_server_stream_manager());
                 }

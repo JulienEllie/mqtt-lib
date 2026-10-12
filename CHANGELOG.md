@@ -10,13 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **The QUIC broker refuses a client stream it does not support instead of closing the connection** (#207). Any client-opened bidirectional stream that was not a flow discard closed the connection with `ERROR_PROTOCOL_L0` (0xB4), including user-defined flows (0x14) and client data flows, which MQoQ §9.20 allows on bidirectional streams. A user-defined flow on a unidirectional stream was read as MQTT, so depending on its bytes it closed the connection as a malformed packet or was left open. As §9.10 describes, only the stream is now refused, and the connection stays up:
-  - a user-defined flow, or a client data flow on a bidirectional stream, with `ERROR_FLOW_REFUSED` (0xBE);
+  - a user-defined flow with `ERROR_FLOW_REFUSED` (0xBE);
   - a server data flow header, or a client data flow whose flow ID has the server bit set, with `ERROR_BAD_FLOW_ID` (0xB6);
   - a control flow header on any stream but the control stream, or a bidirectional stream without a flow header, with `ERROR_STREAM_TYPE` (0xB5).
 
   A refused bidirectional stream gets STOP_SENDING and RESET_STREAM with the code, a unidirectional one STOP_SENDING. Unidirectional streams without a flow header are still read as MQTT.
 - **Discarding a flow now removes its subscriptions** (#207). A discard removed the flow's state but left its flow-bound subscriptions, so the broker kept delivering to a flow the client had discarded. §9.21.2 counts subscriptions as part of the flow state that §9.16 says to discard. The broker now removes them before it answers the discard with FIN.
-- **Only a flow header followed directly by FIN is a discard** (§9.16). A bidirectional stream whose header carried the discard flags was treated as a discard even when MQTT data followed, and the data was dropped. Such a stream is now refused with `ERROR_FLOW_REFUSED`.
+- **Only a flow header followed directly by FIN is a discard** (§9.16). A bidirectional stream whose header carried the discard flags was treated as a discard even when MQTT data followed, and the data was dropped. Such a stream is now served as a client data flow.
+- **The QUIC broker serves client data flows on bidirectional streams** (#207). MQoQ §9.20 lets a client open a data flow on a bidirectional stream, and §9.1.2 keeps the flow's traffic on that flow. The broker now answers each packet on the stream it arrived on (PUBACK, PUBREC, PUBREL, PUBCOMP, SUBACK, UNSUBACK and PINGRESP) and delivers the flow's subscriptions there, retained messages included. DISCONNECT and AUTH stay on the control stream.
+  - A newer stream for the same flow takes it over and the older one is reset (§9.14). A stream older than the newest one the flow has had is reset when it arrives, even if the newer one has already ended.
+  - A FIN from the client ends the flow: the broker answers with FIN and removes the flow's subscriptions (§9.13). If the client resets the stream instead, the flow keeps its subscriptions, and its QoS 1 and 2 messages wait for the client's next stream for it, up to the client's Receive Maximum; QoS 0 messages are dropped meanwhile (§9.21.2). If more messages arrive than that, the broker discards the flow.
+  - A flow that ends inside a packet is reset with `ERROR_INCOMPLETE_PACKET` (0xBA) and kept (§9.13.1).
+
+  The design is checked by a TLA+ model in `specs/tla/bidi-client-flow`.
 
 ## [mqtt5 0.48.0] - 2026-10-11
 

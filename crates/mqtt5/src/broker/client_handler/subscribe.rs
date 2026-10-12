@@ -18,11 +18,19 @@ use tracing::{debug, warn};
 use crate::broker::router::{MessageRouter, RoutableMessage, Subscribed, Unsubscribed};
 use crate::broker::session_slot::SessionSlotGuard;
 
+use super::bidi_flow::BidiFlowEvent;
 use super::ClientHandler;
 
 pub(super) enum FlowEvent {
     Closed(u64),
     Discarded(u64, oneshot::Sender<()>),
+    Bidi(BidiFlowEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlowActivity {
+    Packet,
+    Lifecycle,
 }
 
 struct AcceptedFilter<'a> {
@@ -348,7 +356,7 @@ impl ClientHandler {
                 }
                 let routable = RoutableMessage {
                     publish: msg,
-                    target_flow: None,
+                    target_flow: self.reply_flow,
                 };
                 self.offer_retained(routable);
             }
@@ -439,6 +447,7 @@ impl ClientHandler {
     pub(super) async fn next_flow_event(
         closed_rx: Option<&mut mpsc::Receiver<u64>>,
         discard_rx: Option<&mut mpsc::Receiver<(u64, oneshot::Sender<()>)>>,
+        bidi_rx: Option<&mut mpsc::Receiver<BidiFlowEvent>>,
     ) -> Option<FlowEvent> {
         let closed = async {
             match closed_rx {
@@ -455,16 +464,28 @@ impl ClientHandler {
                 None => std::future::pending().await,
             }
         };
+        let bidi = async {
+            match bidi_rx {
+                Some(rx) => rx.recv().await.map(FlowEvent::Bidi),
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             event = closed => event,
             event = discarded => event,
+            event = bidi => event,
         }
     }
 
-    pub(super) async fn handle_flow_event(&mut self, event: Option<FlowEvent>) {
+    pub(super) async fn handle_flow_event(
+        &mut self,
+        event: Option<FlowEvent>,
+    ) -> Result<FlowActivity> {
         match event {
             Some(FlowEvent::Closed(flow_id)) => self.handle_flow_closed(flow_id).await,
             Some(FlowEvent::Discarded(flow_id, done)) => {
+                #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+                self.discard_bidi_flow(flow_id);
                 self.handle_flow_closed(flow_id).await;
                 if done.send(()).is_err() {
                     debug!(
@@ -473,8 +494,13 @@ impl ClientHandler {
                     );
                 }
             }
+            #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+            Some(FlowEvent::Bidi(event)) => return self.handle_bidi_event(event).await,
+            #[cfg(any(target_arch = "wasm32", not(feature = "transport-quic")))]
+            Some(FlowEvent::Bidi(event)) => match event {},
             None => {}
         }
+        Ok(FlowActivity::Lifecycle)
     }
 
     pub(super) async fn handle_flow_closed(&mut self, flow_id: u64) {

@@ -1,8 +1,12 @@
 mod auth;
+mod bidi_flow;
 mod connect;
 mod lifecycle;
 mod publish;
 mod subscribe;
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+pub(crate) use bidi_flow::{BidiFlowEvent, OpenedStream, StreamEnding};
 
 use crate::broker::auth::AuthProvider;
 use crate::broker::config::BrokerConfig;
@@ -161,6 +165,10 @@ pub struct ClientHandler {
     pub(super) pending_target_flow: Option<u64>,
     pub(super) flow_closed_rx: Option<mpsc::Receiver<u64>>,
     pub(super) flow_discard_rx: Option<mpsc::Receiver<(u64, oneshot::Sender<()>)>>,
+    pub(super) bidi_flow_rx: Option<mpsc::Receiver<bidi_flow::BidiFlowEvent>>,
+    pub(super) reply_flow: Option<u64>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+    pub(super) bidi_flows: HashMap<u64, bidi_flow::BidiFlow>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
     pub(super) flow_registry:
         Option<Arc<tokio::sync::Mutex<crate::session::quic_flow::FlowRegistry>>>,
@@ -283,6 +291,10 @@ impl ClientHandler {
             pending_target_flow: None,
             flow_closed_rx: None,
             flow_discard_rx: None,
+            bidi_flow_rx: None,
+            reply_flow: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+            bidi_flows: HashMap::new(),
             #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
             flow_registry: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
@@ -342,12 +354,20 @@ impl ClientHandler {
         self
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
     #[must_use]
     pub(crate) fn with_flow_discard_rx(
         mut self,
         rx: mpsc::Receiver<(u64, oneshot::Sender<()>)>,
     ) -> Self {
         self.flow_discard_rx = Some(rx);
+        self
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+    #[must_use]
+    pub(crate) fn with_bidi_flow_rx(mut self, rx: mpsc::Receiver<BidiFlowEvent>) -> Self {
+        self.bidi_flow_rx = Some(rx);
         self
     }
 
@@ -803,6 +823,25 @@ impl ClientHandler {
         }
         let write_timeout = self.write_timeout();
         let packet_name = packet.packet_type_name();
+        #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+        if let Some(flow_id) = self
+            .reply_flow
+            .filter(|_| !matches!(packet, Packet::Disconnect(_) | Packet::Auth(_)))
+        {
+            self.write_buffer.clear();
+            encode_packet_to_buffer(&packet, &mut self.write_buffer)?;
+            return timeout(write_timeout, self.write_buffer_to_flow(flow_id))
+                .await
+                .map_err(|_| {
+                    warn!(
+                        packet = packet_name,
+                        timeout = ?write_timeout,
+                        flow_id,
+                        "Flow stream write stalled; treating the client as gone"
+                    );
+                    MqttError::Timeout
+                })?;
+        }
         timeout(write_timeout, self.transport.write_packet(packet))
             .await
             .map_err(|_| {
@@ -971,6 +1010,8 @@ impl ClientHandler {
         self.outbound_inflight.clear();
         self.awaiting_pubcomp.clear();
         unsent.append(&mut self.held);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+        unsent.extend(self.take_detached_messages(&client_id));
         while let Some(routable) = self.qos1_rx.recv().await {
             let qos = routable.publish.qos;
             unsent.push(
@@ -1083,8 +1124,10 @@ impl ClientHandler {
                     }
                 }
 
-                flow_event = Self::next_flow_event(self.flow_closed_rx.as_mut(), self.flow_discard_rx.as_mut()) => {
-                    self.handle_flow_event(flow_event).await;
+                flow_event = Self::next_flow_event(self.flow_closed_rx.as_mut(), self.flow_discard_rx.as_mut(), self.bidi_flow_rx.as_mut()) => {
+                    if self.handle_flow_event(flow_event).await? == subscribe::FlowActivity::Packet {
+                        last_packet_time = Instant::now();
+                    }
                 }
 
                 routable = async {

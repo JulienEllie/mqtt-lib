@@ -297,32 +297,10 @@ async fn a_unidirectional_client_data_flow_is_served() {
 }
 
 #[tokio::test]
-async fn a_bidirectional_client_data_flow_is_refused() {
-    assert_eq!(
-        on_bidi(&with_pingreq(data_flow(1, 0, FlowFlags::default())), false).await,
-        (
-            StreamEnd::Refused(code(QuicStreamCode::FlowRefused)),
-            STILL_SERVED
-        )
-    );
-}
-
-#[tokio::test]
 async fn a_discard_header_ended_by_fin_is_answered_with_fin() {
     assert_eq!(
         on_bidi(&data_flow(1, 0, FlowFlags::discard()), true).await,
         (StreamEnd::Finished, STILL_SERVED)
-    );
-}
-
-#[tokio::test]
-async fn a_discard_header_followed_by_data_is_not_a_discard() {
-    assert_eq!(
-        on_bidi(&with_pingreq(data_flow(1, 0, FlowFlags::discard())), false).await,
-        (
-            StreamEnd::Refused(code(QuicStreamCode::FlowRefused)),
-            STILL_SERVED
-        )
     );
 }
 
@@ -421,4 +399,279 @@ async fn delivered_to_aborted_flow(discard: bool) -> bool {
 async fn discarding_a_flow_removes_its_subscriptions() {
     assert!(delivered_to_aborted_flow(false).await);
     assert!(!delivered_to_aborted_flow(true).await);
+}
+
+const PINGRESP: [u8; 2] = [0xD0, 0x00];
+
+async fn read_frame(recv: &mut quinn::RecvStream) -> Option<Vec<u8>> {
+    let mut frame = vec![0u8; 2];
+    tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut frame))
+        .await
+        .ok()?
+        .ok()?;
+    let mut body = vec![0u8; usize::from(frame[1])];
+    recv.read_exact(&mut body).await.ok()?;
+    frame.extend_from_slice(&body);
+    Some(frame)
+}
+
+async fn reset_code(recv: &mut quinn::RecvStream) -> Option<u64> {
+    match tokio::time::timeout(Duration::from_secs(2), recv.read_to_end(1024)).await {
+        Ok(Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)))) => {
+            Some(code.into_inner())
+        }
+        _ => None,
+    }
+}
+
+fn qos1_subscribe_frame(topic: &str) -> Vec<u8> {
+    let mut frame = subscribe_frame(topic);
+    let last = frame.len() - 1;
+    frame[last] = 0x01;
+    frame
+}
+
+fn qos1_publish_frame(topic: &str, packet_id: u16, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        &u16::try_from(topic.len())
+            .expect("short topic")
+            .to_be_bytes(),
+    );
+    body.extend_from_slice(topic.as_bytes());
+    body.extend_from_slice(&packet_id.to_be_bytes());
+    body.push(0x00);
+    body.extend_from_slice(payload);
+    let mut frame = vec![0x32, u8::try_from(body.len()).expect("short PUBLISH")];
+    frame.extend_from_slice(&body);
+    frame
+}
+
+fn payload_of(frame: &[u8]) -> &[u8] {
+    let topic_len = usize::from(u16::from_be_bytes([frame[2], frame[3]]));
+    let packet_id_len = if frame[0] & 0x06 == 0 { 0 } else { 2 };
+    let properties_at = 4 + topic_len + packet_id_len;
+    &frame[properties_at + 1 + usize::from(frame[properties_at])..]
+}
+
+async fn open_flow(
+    split: &QuicSplitResult,
+    sequence: u64,
+    first: &[u8],
+) -> (quinn::SendStream, quinn::RecvStream) {
+    let (mut send, recv) = split.connection.open_bi().await.expect("open bidi flow");
+    let mut bytes = data_flow(sequence, 300, FlowFlags::default());
+    bytes.extend_from_slice(first);
+    send.write_all(&bytes).await.expect("write flow");
+    (send, recv)
+}
+
+async fn publish_from_control(
+    split: &mut QuicSplitResult,
+    topic: &str,
+    packet_id: u16,
+    payload: &[u8],
+) {
+    split
+        .send
+        .write_all(&qos1_publish_frame(topic, packet_id, payload))
+        .await
+        .expect("publish on control");
+    let puback = read_frame(&mut split.recv)
+        .await
+        .expect("PUBACK on control");
+    assert_eq!(puback[0], 0x40);
+}
+
+async fn nothing_off_the_flow(split: &mut QuicSplitResult) -> bool {
+    let server_stream =
+        tokio::time::timeout(Duration::from_millis(500), split.connection.accept_bi())
+            .await
+            .is_err();
+    server_stream && outcome(split).await == STILL_SERVED
+}
+
+#[tokio::test]
+async fn a_bidirectional_client_data_flow_is_answered_on_its_own_stream() {
+    for flags in [FlowFlags::default(), FlowFlags::discard()] {
+        let (broker, mut split) = connected_session("bidi-served").await;
+        let (mut send, mut recv) = split.connection.open_bi().await.expect("open bidi");
+        send.write_all(&with_pingreq(data_flow(1, 0, flags)))
+            .await
+            .expect("write flow");
+        assert_eq!(read_frame(&mut recv).await, Some(PINGRESP.to_vec()));
+        assert_eq!(outcome(&mut split).await, STILL_SERVED);
+        broker.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn subscriptions_on_a_bidirectional_flow_are_delivered_on_it() {
+    let (broker, mut split) = connected_session("bidi-subscribe").await;
+    let (_send, mut recv) = open_flow(&split, 1, &qos1_subscribe_frame("bidi/a")).await;
+    assert_eq!(
+        read_frame(&mut recv).await,
+        Some(vec![0x90, 0x04, 0x00, 0x01, 0x00, 0x01])
+    );
+    publish_from_control(&mut split, "bidi/a", 7, b"one").await;
+    let delivered = read_frame(&mut recv).await.expect("PUBLISH on the flow");
+    assert_eq!(delivered[0] & 0xF0, 0x30);
+    assert_eq!(payload_of(&delivered), b"one");
+    assert!(nothing_off_the_flow(&mut split).await);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn a_newer_stream_takes_the_flow_over() {
+    let (broker, mut split) = connected_session("bidi-takeover").await;
+    let (_old_send, mut old_recv) = open_flow(&split, 1, &qos1_subscribe_frame("bidi/t")).await;
+    assert!(read_frame(&mut old_recv).await.is_some());
+    let (_new_send, mut new_recv) = open_flow(&split, 1, &PINGREQ).await;
+    assert_eq!(read_frame(&mut new_recv).await, Some(PINGRESP.to_vec()));
+    assert_eq!(
+        reset_code(&mut old_recv).await,
+        Some(code(QuicStreamCode::NoError))
+    );
+    publish_from_control(&mut split, "bidi/t", 8, b"after").await;
+    let delivered = read_frame(&mut new_recv)
+        .await
+        .expect("PUBLISH on the new stream");
+    assert_eq!(payload_of(&delivered), b"after");
+    assert!(nothing_off_the_flow(&mut split).await);
+    broker.stop().await;
+}
+
+async fn late_older_stream_is_refused(newer_aborted: bool) {
+    let (broker, mut split) = connected_session("bidi-late").await;
+    let (mut older_send, mut older_recv) = split.connection.open_bi().await.expect("open older");
+    let (mut newer_send, mut newer_recv) =
+        open_flow(&split, 1, &qos1_subscribe_frame("bidi/l")).await;
+    assert!(read_frame(&mut newer_recv).await.is_some());
+    if newer_aborted {
+        newer_send
+            .reset(quinn::VarInt::from_u32(
+                QuicStreamCode::FlowCancelled.code(),
+            ))
+            .expect("abort the newer stream");
+        assert_eq!(
+            reset_code(&mut newer_recv).await,
+            Some(code(QuicStreamCode::NoError))
+        );
+    }
+    older_send
+        .write_all(&with_pingreq(data_flow(1, 300, FlowFlags::default())))
+        .await
+        .expect("write older");
+    assert_eq!(
+        reset_code(&mut older_recv).await,
+        Some(code(QuicStreamCode::NoError))
+    );
+    if !newer_aborted {
+        publish_from_control(&mut split, "bidi/l", 9, b"newer").await;
+        let delivered = read_frame(&mut newer_recv)
+            .await
+            .expect("PUBLISH on the newer stream");
+        assert_eq!(payload_of(&delivered), b"newer");
+    }
+    assert!(nothing_off_the_flow(&mut split).await);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn an_older_stream_arriving_late_does_not_take_the_flow_back() {
+    late_older_stream_is_refused(false).await;
+    late_older_stream_is_refused(true).await;
+}
+
+#[tokio::test]
+async fn messages_wait_for_a_flow_that_lost_its_stream() {
+    let (broker, mut split) = connected_session("bidi-detached").await;
+    let (mut first_send, mut first_recv) =
+        open_flow(&split, 1, &qos1_subscribe_frame("bidi/d")).await;
+    assert!(read_frame(&mut first_recv).await.is_some());
+    first_send
+        .reset(quinn::VarInt::from_u32(
+            QuicStreamCode::FlowCancelled.code(),
+        ))
+        .expect("abort the flow's stream");
+    assert_eq!(
+        reset_code(&mut first_recv).await,
+        Some(code(QuicStreamCode::NoError))
+    );
+    split
+        .send
+        .write_all(&publish_frame("bidi/d", b"qos0"))
+        .await
+        .expect("QoS 0 publish");
+    publish_from_control(&mut split, "bidi/d", 10, b"waited").await;
+    assert!(nothing_off_the_flow(&mut split).await);
+    let (mut second_send, mut second_recv) = open_flow(&split, 1, &[]).await;
+    let delivered = read_frame(&mut second_recv).await.expect("waiting PUBLISH");
+    assert_eq!(delivered[0] & 0x06, 0x02);
+    assert_eq!(payload_of(&delivered), b"waited");
+    let packet_id = [delivered[10], delivered[11]];
+    second_send
+        .write_all(&[0x40, 0x02, packet_id[0], packet_id[1], 0xC0, 0x00])
+        .await
+        .expect("PUBACK and PINGREQ on the flow");
+    assert_eq!(read_frame(&mut second_recv).await, Some(PINGRESP.to_vec()));
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn finishing_a_bidirectional_flow_ends_it() {
+    let (broker, mut split) = connected_session("bidi-finish").await;
+    let (mut send, mut recv) = open_flow(&split, 1, &subscribe_frame("bidi/f")).await;
+    assert!(read_frame(&mut recv).await.is_some());
+    send.finish().expect("finish the flow");
+    let rest = tokio::time::timeout(Duration::from_secs(2), recv.read_to_end(64))
+        .await
+        .expect("flow finished by the broker")
+        .expect("flow ends with FIN");
+    assert!(rest.is_empty());
+    split
+        .send
+        .write_all(&publish_frame("bidi/f", b"gone"))
+        .await
+        .expect("publish");
+    assert!(nothing_off_the_flow(&mut split).await);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn a_bidirectional_flow_ending_inside_a_packet_is_reset() {
+    let (broker, mut split) = connected_session("bidi-incomplete").await;
+    let (mut send, mut recv) = open_flow(&split, 1, &PINGREQ[..1]).await;
+    send.finish().expect("finish inside a packet");
+    assert_eq!(
+        reset_code(&mut recv).await,
+        Some(code(QuicStreamCode::IncompletePacket))
+    );
+    assert_eq!(outcome(&mut split).await, STILL_SERVED);
+    broker.stop().await;
+}
+
+#[tokio::test]
+async fn retained_messages_for_a_bidirectional_flow_arrive_on_it() {
+    let (broker, mut split) = connected_session("bidi-retained").await;
+    let mut retained = publish_frame("bidi/r", b"kept");
+    retained[0] = 0x31;
+    split
+        .send
+        .write_all(&retained)
+        .await
+        .expect("retained publish");
+    assert!(outcome(&mut split).await.session_alive);
+    let (_send, mut recv) = open_flow(&split, 1, &qos1_subscribe_frame("bidi/r")).await;
+    assert_eq!(
+        read_frame(&mut recv).await,
+        Some(vec![0x90, 0x04, 0x00, 0x01, 0x00, 0x01])
+    );
+    let delivered = read_frame(&mut recv)
+        .await
+        .expect("retained PUBLISH on the flow");
+    assert_eq!(delivered[0] & 0x01, 0x01);
+    assert_eq!(payload_of(&delivered), b"kept");
+    assert!(nothing_off_the_flow(&mut split).await);
+    broker.stop().await;
 }
