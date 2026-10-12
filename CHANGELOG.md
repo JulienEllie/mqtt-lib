@@ -5,12 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [mqtt5 0.48.0] - 2026-10-11
 
 ### Breaking
 
 - **`ConnectOptions` has a new public field, `websocket_config`.** Code that builds `ConnectOptions` with a struct literal must add it. The field exists only with the `transport-websocket` feature, which is on by default.
 - **`WebSocketConfig` has a new public field, `request_modifier`.** Code that builds `WebSocketConfig` with a struct literal must add it.
+- **ALPN protocols on a `WebSocketConfig`'s TLS configuration are now offered on `wss://`.** They were ignored before. A WebSocket server negotiates HTTP, so one that advertises only `http/1.1`, as this crate's `wss://` listener does, now rejects a handshake that offers only an MQTT protocol such as `mqtt` with `NoApplicationProtocol`. `MqttClient` does not offer its stored configuration's ALPN protocols on `wss://` (for example those set with `connect_with_tls`, such as AWS IoT's `x-amzn-mqtt-ca`), since they select MQTT directly over TLS.
+- **WebSocket configurations that relied on the old behavior may connect differently or fail to connect.** Because the configuration now reaches the wire:
+  - A custom header that is invalid or reserved (see the next entry) used to be silently dropped. It now makes `connect` fail.
+  - Every WebSocket connection, including those made by `MqttClient`, now sends a `User-Agent` header unless `WebSocketConfig::user_agent` is `None`.
+- **`connect` rejects a WebSocket configuration it cannot send faithfully, before dialing.** It fails with `MqttError::Configuration` in these cases:
+  - a custom header has an invalid name or value, or repeats another custom header's name (case-insensitively);
+  - a custom header names one reserved for the handshake: `Host`, `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`, `Sec-WebSocket-Extensions` or `Sec-WebSocket-Accept`;
+  - a custom header is `Content-Length`, `Transfer-Encoding` or `Trailer`, which would describe a body the upgrade request does not have, or a hop-by-hop or expectation header: `TE`, `Keep-Alive`, `Proxy-Connection` or `Expect`;
+  - `Sec-WebSocket-Protocol` or `User-Agent` is set as a custom header instead of through its setter;
+  - a subprotocol is not a valid HTTP token, or is listed more than once (RFC 6455 §4.1).
+- **`MqttClient` returns WebSocket transport errors unchanged.** It wrapped every one in `MqttError::ConnectionError("WebSocket connect failed: ...")`, so a handshake that timed out was not `MqttError::Timeout` and a configuration the transport rejected was not `MqttError::Configuration`. The transport's own connection errors still start with "WebSocket connect failed".
+- **`MqttClient` no longer resolves the host of a ws:// or wss:// address itself.** The handshake dials the URL's host, so the separate lookup only added a second resolution. A host that does not resolve now fails with the transport's "WebSocket connect failed" error instead of "Failed to resolve address".
 
 ### Fixed
 
@@ -18,34 +30,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`WebSocketConfig::with_tls_auto`, and the `with_ca_cert_*` and `with_client_auth_*` methods that call it, now accept a host name URL** (#190). They parsed the URL's host and port as a socket address, so they failed with "Invalid host/port combination" for anything but an IP address. A wss:// connection takes its server and certificate name from the URL and does not use `TlsConfig::addr`, so for a host name that is now the unspecified address `0.0.0.0` with the URL's port; set a real address before using such a config with `TlsTransport`.
 - **`MqttClient` now uses its stored TLS configuration for `wss://` connections** (#190), as it already did for `mqtts://`. A CA, client certificate or key set with `set_tls_config` was ignored over WebSocket, and `set_insecure_tls(true)` replaced the stored configuration with a bare one that disables verification.
 - **The WebSocket client transport now sends its configured headers, subprotocols and user agent** (#165). `WebSocketTransport::connect` built the upgrade request from a fixed set of headers and always offered `Sec-WebSocket-Protocol: mqtt`, so anything set with `WebSocketConfig::with_header`, `with_subprotocol`, `with_subprotocols` or `with_user_agent` never reached the server, and brokers that authenticate the upgrade request through custom headers rejected the connection. The request now carries every custom header, the configured subprotocols in order, followed by `mqtt` when the list does not include it (MQTT-6.0.0-3), and the user agent when one is set. The default user agent is now `mqtt5/<crate version>` instead of `mqtt-v5/0.4.0`.
-- **`MqttClient` now opens one WebSocket connection per connection attempt.** It repeated the whole ws:// or wss:// handshake once for every address the host name resolved to, while each handshake dialed the URL's host itself, so a refused or failed attempt to `localhost` reached the server twice.
-- **The upgrade request's `Host` header now includes a non-default port**, so `ws://broker:8080/mqtt` sends `Host: broker:8080` rather than `Host: broker`.
+- **`MqttClient` now opens one WebSocket connection per connection attempt** (#217). It repeated the whole ws:// or wss:// handshake once for every address the host name resolved to, while each handshake dialed the URL's host itself, so a refused or failed attempt to `localhost` reached the server twice.
+- **The upgrade request's `Host` header now includes a non-default port** (#165), so `ws://broker:8080/mqtt` sends `Host: broker:8080` rather than `Host: broker`.
 
 ### Changed
 
-- **ALPN protocols on a `WebSocketConfig`'s TLS configuration are now offered on `wss://`.** They were ignored before. A WebSocket server negotiates HTTP, so one that advertises only `http/1.1`, as this crate's `wss://` listener does, now rejects a handshake that offers only an MQTT protocol such as `mqtt` with `NoApplicationProtocol`. `MqttClient` does not offer its stored configuration's ALPN protocols on `wss://` (for example those set with `connect_with_tls`, such as AWS IoT's `x-amzn-mqtt-ca`), since they select MQTT directly over TLS.
-- **WebSocket configurations that relied on the old behavior may connect differently or fail to connect.** Because the configuration now reaches the wire:
-  - A custom header that is invalid or reserved (see the next entry) used to be silently dropped. It now makes `connect` fail.
-  - Every WebSocket connection, including those made by `MqttClient`, now sends a `User-Agent` header.
-- **`connect` rejects a WebSocket configuration it cannot send faithfully, before dialing.** It fails with `MqttError::Configuration` in these cases:
-  - a custom header has an invalid name or value, or repeats another custom header's name (case-insensitively);
-  - a custom header names one reserved for the handshake: `Host`, `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`, `Sec-WebSocket-Extensions` or `Sec-WebSocket-Accept`;
-  - a custom header is `Content-Length`, `Transfer-Encoding` or `Trailer`, which would describe a body the upgrade request does not have, or a hop-by-hop or expectation header: `TE`, `Keep-Alive`, `Proxy-Connection` or `Expect`;
-  - `Sec-WebSocket-Protocol` or `User-Agent` is set as a custom header instead of through its setter;
-  - a subprotocol is not a valid HTTP token, or is listed more than once (RFC 6455 §4.1).
 - Custom headers are sent, and validated, in name order, so the request and the error a bad configuration reports no longer depend on `HashMap` iteration order.
 - `WebSocketConfig`'s `Debug` output lists custom header names but not their values, which often carry credentials.
-- **`MqttClient` returns WebSocket transport errors unchanged.** It wrapped every one in `MqttError::ConnectionError("WebSocket connect failed: ...")`, so a handshake that timed out was not `MqttError::Timeout` and a configuration the transport rejected was not `MqttError::Configuration`. The transport's own connection errors still start with "WebSocket connect failed".
-- **`MqttClient` no longer resolves the host of a ws:// or wss:// address itself.** The handshake dials the URL's host, so the separate lookup only added a second resolution. A host that does not resolve now fails with the transport's "WebSocket connect failed" error instead of "Failed to resolve address".
 
 ### Added
 
 - **`ConnectOptions::with_websocket_config`, so `MqttClient` can send custom WebSocket handshake headers** (#165). `MqttClient` built each connection's `WebSocketConfig` from the URL alone, so its ws:// and wss:// connections could not carry custom headers, subprotocols or a user agent. The configuration set here is applied on every connection attempt, including automatic reconnects, with the URL taken from the address passed to `connect`; for wss://, its TLS configuration, when it has one, is used in place of the one stored with `set_tls_config` or `connect_with_tls`. A connection that follows a server redirect (`UseAnotherServer` or `ServerMoved`) does not use it, so its headers are never sent to a host the broker names.
 - `WebSocketConfig` implements `Clone`.
 - **`WebSocketConfig::with_request_modifier`, an async callback that adjusts the WebSocket upgrade request before each connection attempt** (#165). It receives the validated request and returns the one to send, so it can add values computed at connect time, such as a short-lived signed token, or replace the URI with a presigned one. Set on the `WebSocketConfig` given to `ConnectOptions::with_websocket_config`, it runs before every `MqttClient` connection attempt, including automatic reconnects. It runs within the connect timeout, and an error fails the attempt with `MqttError::ConnectionError`, logged at error level. The returned request must keep the URI's scheme, the handshake headers the transport sets, and a `Sec-WebSocket-Protocol` header that offers `mqtt`, and must not add a header `with_header` reserves; otherwise the attempt fails with `MqttError::Configuration` before dialing. Because `MqttClient` does not resolve a WebSocket address, the address passed to `connect` can name a placeholder host that the callback replaces.
-- `TlsConfig::client_config`, which returns the rustls client configuration a `TlsConfig` describes.
 - `RequestModifier` and `RequestModifierError` are exported from `mqtt5::transport`.
+- `TlsConfig::client_config`, which returns the rustls client configuration a `TlsConfig` describes.
 - `WebSocketConfig::build_handshake_request`, which returns the upgrade request the configuration produces.
+
+## [mqttv5-cli 0.29.7] - 2026-10-11
+
+### Fixed
+
+- `pub`, `sub` and `bench` now apply `--ca-cert`, `--cert` and `--key` to `wss://` URLs. Before, they were only applied to `mqtts://`, `ssl://` and `quics://`, so a `wss://` broker with a private CA failed with `UnknownIssuer`.
+
+### Changed
+
+- Requires mqtt5 0.48. See mqtt5 0.48.0 for the WebSocket client changes.
+
+## [mqtt5-wasm 2.1.7] - 2026-10-11
+
+### Changed
+
+- Requires mqtt5 0.48. No change to the wasm API.
 
 ## [mqtt5 0.47.3] - 2026-10-09
 
