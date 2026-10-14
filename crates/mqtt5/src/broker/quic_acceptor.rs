@@ -13,6 +13,7 @@ use crate::transport::flow::{
     FlowFlags, FlowHeader, FlowId, FLOW_TYPE_CLIENT_DATA, FLOW_TYPE_CONTROL, FLOW_TYPE_SERVER_DATA,
     FLOW_TYPE_USER_DEFINED,
 };
+use crate::transport::packet_io::decode_buffered_packet;
 use bytes::{Buf, Bytes, BytesMut};
 use mqtt5_protocol::QuicStreamCode;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, ServerConfig};
@@ -452,81 +453,23 @@ pub(super) async fn read_packet_with_buffer(
     recv: &mut RecvStream,
     buffer: &mut BytesMut,
     protocol_version: u8,
+    max_packet_size: usize,
 ) -> Result<Packet> {
-    while buffer.len() < 2 {
-        let mut tmp = [0u8; 64];
+    loop {
+        if let Some(packet) = decode_buffered_packet(buffer, protocol_version, max_packet_size)? {
+            return Ok(packet);
+        }
+        let mut chunk = [0u8; 1024];
         let n = recv
-            .read(&mut tmp)
+            .read(&mut chunk)
             .await
             .map_err(|e| MqttError::ConnectionError(format!("QUIC read error: {e}")))?
             .ok_or(MqttError::ClientClosed)?;
         if n == 0 {
             return Err(MqttError::ClientClosed);
         }
-        buffer.extend_from_slice(&tmp[..n]);
+        buffer.extend_from_slice(&chunk[..n]);
     }
-
-    let mut remaining_length = 0u32;
-    let mut multiplier = 1u32;
-    let mut remaining_length_bytes = 1usize;
-
-    for i in 1..5 {
-        if i >= buffer.len() {
-            let mut tmp = [0u8; 64];
-            let n = recv
-                .read(&mut tmp)
-                .await
-                .map_err(|e| MqttError::ConnectionError(format!("QUIC read error: {e}")))?
-                .ok_or(MqttError::ClientClosed)?;
-            if n == 0 {
-                return Err(MqttError::ClientClosed);
-            }
-            buffer.extend_from_slice(&tmp[..n]);
-        }
-
-        let byte = buffer[i];
-        remaining_length += u32::from(byte & 0x7F) * multiplier;
-        multiplier *= 128;
-        remaining_length_bytes = i;
-
-        if (byte & 0x80) == 0 {
-            break;
-        }
-
-        if i == 4 {
-            return Err(MqttError::MalformedPacket(
-                "Invalid remaining length encoding".to_string(),
-            ));
-        }
-    }
-
-    let header_len = 1 + remaining_length_bytes;
-    let total_len = header_len + remaining_length as usize;
-
-    while buffer.len() < total_len {
-        let mut tmp = [0u8; 1024];
-        let n = recv
-            .read(&mut tmp)
-            .await
-            .map_err(|e| MqttError::ConnectionError(format!("QUIC read error: {e}")))?
-            .ok_or(MqttError::ClientClosed)?;
-        if n == 0 {
-            return Err(MqttError::ClientClosed);
-        }
-        buffer.extend_from_slice(&tmp[..n]);
-    }
-
-    let packet_bytes = buffer.split_to(total_len);
-    let mut header_buf = packet_bytes.clone().freeze();
-    let fixed_header = FixedHeader::decode(&mut header_buf)?;
-
-    let mut payload_buf = BytesMut::from(&packet_bytes[header_len..]);
-    Packet::decode_from_body_with_version(
-        fixed_header.packet_type,
-        &fixed_header,
-        &mut payload_buf,
-        protocol_version,
-    )
 }
 
 pub struct QuicHandlerContext {
@@ -588,6 +531,7 @@ async fn run_quic_handler_inner(
     let transport = BrokerTransport::quic(stream);
 
     let delivery_strategy = context.config.server_delivery_strategy;
+    let max_packet_size = context.config.max_packet_size;
     let connection_alive = context.connection_alive;
     let handler = ClientHandler::new_with_external_packets(
         transport,
@@ -630,6 +574,7 @@ async fn run_quic_handler_inner(
         packet_tx.clone(),
         protocol_version_rx.clone(),
         peer_addr,
+        max_packet_size,
         label,
     );
     spawn_bi_accept_loop(
@@ -641,12 +586,15 @@ async fn run_quic_handler_inner(
     );
     spawn_quic_stats_sampler(connection.clone(), peer_addr);
     spawn_uni_accept_loop(
-        connection,
-        packet_tx,
-        protocol_version_rx,
-        peer_addr,
-        flow_registry,
-        flow_closed_tx,
+        DataStreamContext {
+            connection,
+            packet_tx,
+            protocol_version_rx,
+            peer_addr,
+            flow_registry,
+            flow_closed_tx,
+            max_packet_size,
+        },
         label,
     );
 }
@@ -726,6 +674,7 @@ fn spawn_datagram_reader(
     packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
     protocol_version_rx: watch::Receiver<Option<u8>>,
     peer_addr: SocketAddr,
+    max_packet_size: usize,
     label: &'static str,
 ) {
     tokio::spawn(async move {
@@ -742,10 +691,14 @@ fn spawn_datagram_reader(
                         label,
                         peer_addr
                     );
-                    let packet = match decode_datagram_packet(&datagram, protocol_version) {
+                    let packet = match decode_datagram_packet(
+                        &datagram,
+                        protocol_version,
+                        max_packet_size,
+                    ) {
                         Some(Ok(packet)) => packet,
                         Some(Err(e)) => {
-                            close_on_malformed_packet(&connection, peer_addr, "datagram", &e);
+                            close_on_protocol_error(&connection, peer_addr, "datagram", &e);
                             break;
                         }
                         None => continue,
@@ -794,32 +747,25 @@ fn spawn_bi_accept_loop(
     });
 }
 
-fn spawn_uni_accept_loop(
+#[derive(Clone)]
+struct DataStreamContext {
     connection: Arc<Connection>,
     packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
     protocol_version_rx: watch::Receiver<Option<u8>>,
     peer_addr: SocketAddr,
     flow_registry: Arc<Mutex<FlowRegistry>>,
     flow_closed_tx: mpsc::Sender<u64>,
-    label: &'static str,
-) {
+    max_packet_size: usize,
+}
+
+fn spawn_uni_accept_loop(context: DataStreamContext, label: &'static str) {
     tokio::spawn(async move {
+        let peer_addr = context.peer_addr;
         loop {
-            match connection.accept_uni().await {
+            match context.connection.accept_uni().await {
                 Ok(recv) => {
-                    debug!(
-                        "Additional {} data stream accepted from {}",
-                        label, peer_addr
-                    );
-                    spawn_data_stream_reader(
-                        connection.clone(),
-                        recv,
-                        packet_tx.clone(),
-                        protocol_version_rx.clone(),
-                        peer_addr,
-                        flow_registry.clone(),
-                        flow_closed_tx.clone(),
-                    );
+                    debug!("Additional {label} data stream accepted from {peer_addr}");
+                    spawn_data_stream_reader(context.clone(), recv);
                 }
                 Err(e) => {
                     let reason = crate::transport::quic_error::parse_connection_error(&e);
@@ -831,9 +777,19 @@ fn spawn_uni_accept_loop(
     });
 }
 
-fn decode_datagram_packet(data: &Bytes, protocol_version: u8) -> Option<Result<Packet>> {
+fn decode_datagram_packet(
+    data: &Bytes,
+    protocol_version: u8,
+    max_packet_size: usize,
+) -> Option<Result<Packet>> {
     if data.is_empty() || data[0] == 0x00 {
         return None;
+    }
+    if data.len() > max_packet_size {
+        return Some(Err(MqttError::PacketTooLarge {
+            size: data.len(),
+            max: max_packet_size,
+        }));
     }
 
     let mut buf = BytesMut::from(data.as_ref());
@@ -961,13 +917,13 @@ async fn close_after_control_flow(
     close_connection(connection, code);
 }
 
-fn close_on_malformed_packet(
+pub(super) fn close_on_protocol_error(
     connection: &Connection,
     peer_addr: SocketAddr,
     source: &str,
     error: &MqttError,
 ) {
-    warn!("malformed packet on {source} from {peer_addr}, closing connection: {error}");
+    warn!("protocol error on {source} from {peer_addr}, closing connection: {error}");
     close_connection(
         connection,
         mqtt5_protocol::QuicConnectionCode::ProtocolLevel0,
@@ -981,16 +937,17 @@ fn close_connection(connection: &Connection, code: mqtt5_protocol::QuicConnectio
     );
 }
 
-fn spawn_data_stream_reader(
-    connection: Arc<Connection>,
-    mut recv: RecvStream,
-    packet_tx: mpsc::Sender<(Packet, Option<u64>)>,
-    protocol_version_rx: watch::Receiver<Option<u8>>,
-    peer_addr: SocketAddr,
-    flow_registry: Arc<Mutex<FlowRegistry>>,
-    flow_closed_tx: mpsc::Sender<u64>,
-) {
+fn spawn_data_stream_reader(context: DataStreamContext, mut recv: RecvStream) {
     tokio::spawn(async move {
+        let DataStreamContext {
+            connection,
+            packet_tx,
+            protocol_version_rx,
+            peer_addr,
+            flow_registry,
+            flow_closed_tx,
+            max_packet_size,
+        } = context;
         let Some(protocol_version) = negotiated_protocol_version(protocol_version_rx).await else {
             debug!("client handler ended before CONNECT from {peer_addr}");
             return;
@@ -1026,7 +983,9 @@ fn spawn_data_stream_reader(
         };
 
         loop {
-            match read_packet_with_buffer(&mut recv, &mut buffer, protocol_version).await {
+            match read_packet_with_buffer(&mut recv, &mut buffer, protocol_version, max_packet_size)
+                .await
+            {
                 Ok(packet) => {
                     if let Some(id) = flow_id {
                         let mut registry = flow_registry.lock().await;
@@ -1052,7 +1011,7 @@ fn spawn_data_stream_reader(
                     break;
                 }
                 Err(e) => {
-                    close_on_malformed_packet(&connection, peer_addr, "data stream", &e);
+                    close_on_protocol_error(&connection, peer_addr, "data stream", &e);
                     break;
                 }
             }

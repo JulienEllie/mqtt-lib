@@ -41,9 +41,11 @@ impl Drop for ServerStreamInfo {
 /// The client writes bare MQTT packets here (no flow header), so unlike a client-initiated
 /// data stream there is no header to parse.
 fn spawn_ack_reader(
+    connection: Arc<Connection>,
     mut recv: RecvStream,
     flow_id: FlowId,
     protocol_version: u8,
+    max_packet_size: usize,
     packet_tx: PacketSender,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -53,6 +55,7 @@ fn spawn_ack_reader(
                 &mut recv,
                 &mut buffer,
                 protocol_version,
+                max_packet_size,
             )
             .await
             {
@@ -66,8 +69,17 @@ fn spawn_ack_reader(
                         break;
                     }
                 }
-                Err(e) => {
+                Err(e @ (MqttError::ClientClosed | MqttError::ConnectionError(_))) => {
                     trace!(flow_id = ?flow_id, "Server data flow ack reader ended: {e}");
+                    break;
+                }
+                Err(e) => {
+                    crate::broker::quic_acceptor::close_on_protocol_error(
+                        &connection,
+                        connection.remote_address(),
+                        "server data flow",
+                        &e,
+                    );
                     break;
                 }
             }
@@ -82,6 +94,7 @@ const FLOW_EXPIRE_INTERVAL: u64 = 300;
 pub struct ServerStreamManager {
     connection: Arc<Connection>,
     protocol_version: u8,
+    max_packet_size: usize,
     strategy: ServerDeliveryStrategy,
     topic_streams: HashMap<String, ServerStreamInfo>,
     flow_streams: HashMap<u64, ServerStreamInfo>,
@@ -92,10 +105,11 @@ pub struct ServerStreamManager {
 }
 
 impl ServerStreamManager {
-    pub fn new(connection: Arc<Connection>, protocol_version: u8) -> Self {
+    pub fn new(connection: Arc<Connection>, protocol_version: u8, max_packet_size: usize) -> Self {
         Self {
             connection,
             protocol_version,
+            max_packet_size,
             strategy: ServerDeliveryStrategy::default(),
             topic_streams: HashMap::new(),
             flow_streams: HashMap::new(),
@@ -127,7 +141,14 @@ impl ServerStreamManager {
             );
             return None;
         };
-        Some(spawn_ack_reader(recv, flow_id, self.protocol_version, tx))
+        Some(spawn_ack_reader(
+            self.connection.clone(),
+            recv,
+            flow_id,
+            self.protocol_version,
+            self.max_packet_size,
+            tx,
+        ))
     }
 
     #[must_use]
