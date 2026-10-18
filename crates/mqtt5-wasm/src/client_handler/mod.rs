@@ -235,9 +235,6 @@ impl WasmClientHandler {
         });
     }
 
-    /// Writes one outbound publish to the client, assigning a packet id and persisting the
-    /// exactly-once inflight record. Returns `false` on a fatal write error so the forwarder
-    /// stops. Shared by the two delivery lanes and the drained session queue.
     async fn forward_one(
         mut publish: PublishPacket,
         writer: &Rc<RefCell<WasmWriter>>,
@@ -297,6 +294,7 @@ impl WasmClientHandler {
         let storage_fwd = Arc::clone(&self.storage);
         let client_id_fwd = self.client_id.clone().unwrap_or_default();
         let handler_id = self.handler_id;
+        let protocol_version = self.protocol_version;
 
         spawn_local(async move {
             'outer: loop {
@@ -304,7 +302,7 @@ impl WasmClientHandler {
                     break;
                 }
 
-                let publish = tokio::select! {
+                let mut publish = tokio::select! {
                     lane = qos1_rx.recv() => match lane {
                         Some(routable) => routable.publish,
                         None => break,
@@ -322,8 +320,10 @@ impl WasmClientHandler {
                         if let Some(queue) = &queue {
                             let mut pending = queue.take(64).await.into_iter();
                             while let Some(message) = pending.next() {
+                                let mut queued = message.to_publish_packet();
+                                queued.protocol_version = protocol_version;
                                 if !Self::forward_one(
-                                    message.to_publish_packet(),
+                                    queued,
                                     &writer_for_forward,
                                     &outbound_inflight_fwd,
                                     &next_pid_fwd,
@@ -333,9 +333,6 @@ impl WasmClientHandler {
                                 )
                                 .await
                                 {
-                                    // A write error must not drop the drained batch: put the
-                                    // failed message and the untried remainder back at the
-                                    // front so they survive for redelivery.
                                     let mut rest = vec![message];
                                     rest.extend(pending);
                                     queue.requeue_front_in_epoch(rest, queue_epoch);
@@ -352,6 +349,7 @@ impl WasmClientHandler {
                     }
                 };
 
+                publish.protocol_version = protocol_version;
                 if !Self::forward_one(
                     publish,
                     &writer_for_forward,
