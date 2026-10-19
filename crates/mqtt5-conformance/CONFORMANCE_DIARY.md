@@ -31,12 +31,65 @@
 - [x] Phase 1 — Extended CONNECT/Session/Will (14 tests, 19 normative statements)
 - [x] Phase 3 — QoS Protocol State Machine (12 tests, 15 normative statements)
 - [x] Final 7 remaining untested — 7 tests, 0 remaining Untested
+- [x] Offline queued delivery (8 tests, 4 normative statements)
 
 **Rule**: after every step, every detail learned, every fix applied — add an entry here. New entries go on top, beneath this plan list.
 
 ---
 
 ## Diary Entries
+
+### Offline queued delivery: review fixes (2026-10-19)
+
+**Trigger**: code review of #250.
+
+**Drain loop**: the subscriber answered every queued PUBLISH with a PUBACK, including a QoS 2 one. Against a broker that wrongly queues the QoS 2 probe at QoS 2, that is a protocol error, the broker may disconnect before the marker, and the test failed with a read error instead of the MQTT-3.8.4-8 assertion. A QoS 2 PUBLISH is now returned as soon as it arrives, so the QoS assertion reports it.
+
+**Retained cleanup**: the two RETAIN tests left a retained message on a new topic every run, which piles up on a long-lived external SUT and counts against its retained limit. Both now clear the topic with an empty retained message.
+
+**QoS 0 tests**: `offline_queued_qos0_is_not_upgraded` and `offline_shared_queued_qos0_is_not_upgraded` pass when nothing is delivered, because MQTT 5 lets a server skip QoS 0 for an offline session. Since #248 our broker never queues QoS 0, so against it these tests only check that a QoS 0 message is not delivered as QoS 1. A broker that queues QoS 0 runs the assertion.
+
+**Known limit**: the tests wait a fixed 200 ms after the subscriber's DISCONNECT before publishing, the same pattern the rest of the suite uses. If a SUT takes longer to mark the session offline, the probe is delivered live to the closing connection and the test fails with "a queued PUBLISH arrives before the marker".
+
+**Harness cleanup**: `raw_client.rs` no longer has a file-level lint allow. Lengths go through checked conversions, `encode_variable_int` takes a `usize`, and the three public functions returning `io::Result` document their errors. `connect_resume` and `connect_with_session_expiry` share one builder, and so do `publish_qos1_retained` and `publish_qos1_with_dup`. The `ParsedProperties` doc no longer says unknown property IDs are tolerated.
+
+### What the suite cannot see: 3.1.1, the wasm broker, $SYS publishing (2026-10-19)
+
+**Trigger**: the same review found three problems the suite does not cover. None of them can be closed with a test in this crate today.
+
+**MQTT 3.1.1 negative acks (#247)**: when the broker refuses a QoS 1 or QoS 2 PUBLISH from a 3.1.1 client, it sends an MQTT 5 PUBACK or PUBREC with a reason code and a Reason String, which is malformed in 3.1.1 (MQTT 3.1.1 MQTT-3.3.5-2: positive ack or close). The manifest and the statement lists are MQTT 5 only, so there is no statement to attach a test to.
+
+**wasm Topic Alias (#249)**: the wasm broker advertises Topic Alias Maximum 65535 but never resolves inbound aliases. `section3_publish_alias.rs` covers MQTT-3.3.2-11 and MQTT-3.3.2-12, but every fixture is a native broker, so the suite has never run against the wasm broker.
+
+**`dollar_sys_publish` and #246**: `dollar_topics_matched_by_explicit_prefix` (MQTT-4.7.2-1) has a client publish to `$SYS/test` and expects a `$SYS/#` subscriber to get it, and the `full-broker` profile and the in-process fixture declare `dollar_sys_publish = true`. #246 is about the broker letting clients exchange messages on `$` topics, which MQTT 5 §4.7.2 says a server SHOULD prevent. When #246 is fixed, the in-process fixture loses that capability, and the explicit-prefix test needs a message the broker publishes itself (for example `$SYS/broker/uptime`) so it can still run.
+
+### Offline queued delivery: coverage gap, parser fix, broker fix (2026-10-19)
+
+**Trigger**: a spec review of the 0.48.2 changes found that messages queued for an offline persistent session come back with the wrong flags (#248). MQTT-3.8.4-8, MQTT-3.3.1-12, MQTT-3.3.1-3 and MQTT-4.8.2-3 were all marked Tested, but every test behind them delivers to a connected subscriber, so the offline queue was never exercised.
+
+**New tests** in `section3_offline_delivery.rs`. Each one connects a subscriber with a 300 s Session Expiry, subscribes at QoS 1 with Retain As Published 0, and disconnects normally. A publisher sends the probe message and then a QoS 1 marker. The subscriber reconnects with Clean Start 0, and the test reads queued PUBLISH packets until the marker, so the marker proves the queue was drained:
+
+| test | statement | probe |
+|---|---|---|
+| `offline_queued_qos0_is_not_upgraded` | MQTT-3.8.4-8 | QoS 0 |
+| `offline_queued_qos2_is_downgraded` | MQTT-3.8.4-8 | QoS 2 |
+| `offline_queued_retain_is_cleared` | MQTT-3.3.1-12 | QoS 1, RETAIN 1 |
+| `offline_queued_dup_is_cleared` | MQTT-3.3.1-3 | QoS 1, DUP 1 |
+| `offline_shared_queued_qos0_is_not_upgraded` | MQTT-4.8.2-3 | QoS 0, `$share/<group>/...` |
+| `offline_shared_queued_qos2_is_downgraded` | MQTT-4.8.2-3 | QoS 2, shared |
+| `offline_shared_queued_retain_is_cleared` | MQTT-3.3.1-12 | QoS 1, RETAIN 1, shared |
+| `offline_shared_queued_dup_is_cleared` | MQTT-3.3.1-3 | QoS 1, DUP 1, shared |
+
+Queuing QoS 0 messages for an offline session is optional, so the two QoS 0 tests accept no delivery and only fail if the message arrives above QoS 0.
+
+**Harness problems found on the way**:
+- `expect_connack` does a single socket read. On a resumed session the broker sends the CONNACK and the queued PUBLISH packets together, so the read swallowed them. The new tests read with `read_mqtt_packet`, which frames packets.
+- `ParsedProperties::parse` returned `None` for every property it does not extract, including all the CONNACK-only ones, so `ParsedConnAck::parse` rejected any CONNACK with properties. It now steps over every property defined in MQTT 5 by its encoded type and still rejects unknown IDs and truncated values. There are new unit tests for both cases.
+- `build_connect_resume` moved from `section3_connect.rs` to `RawPacketBuilder::connect_resume`. `RawPacketBuilder::publish_qos1_retained` is new.
+
+**Control** on main (eceda86), before the broker fix: four tests failed and four passed, matching the runtime reproduction in #248. These failed: plain QoS 0 (delivered at QoS 1), shared QoS 0 (QoS 1), shared RETAIN (RETAIN 1) and shared DUP (DUP 1). The QoS 2 downgrade was already correct on both paths, and so were plain RETAIN and DUP.
+
+**Broker fix** in `router.rs`: the plain offline path queues at the effective QoS, and the all-members-offline shared path goes through `prepare_message` with the effective QoS instead of cloning the publish. A message whose effective QoS is 0 is not queued, which matches the rate-limited path. With the fix, the in-process suite passes 243 of 243.
 
 ### Mosquitto interop job: Ubuntu archive package instead of a registry image (2026-10-09)
 

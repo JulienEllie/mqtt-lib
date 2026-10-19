@@ -21,6 +21,10 @@ const PROP_SUBSCRIPTION_IDENTIFIER: u8 = 0x0B;
 const PROP_REASON_STRING: u8 = 0x1F;
 const PROP_TOPIC_ALIAS: u8 = 0x23;
 const PROP_USER_PROPERTY: u8 = 0x26;
+const BYTE_PROPERTIES: [u8; 7] = [0x17, 0x19, 0x24, 0x25, 0x28, 0x29, 0x2A];
+const TWO_BYTE_PROPERTIES: [u8; 3] = [0x13, 0x21, 0x22];
+const FOUR_BYTE_PROPERTIES: [u8; 3] = [0x11, 0x18, 0x27];
+const LENGTH_PREFIXED_PROPERTIES: [u8; 5] = [0x12, 0x15, 0x1A, 0x1C, 0x16];
 
 /// Decodes an MQTT variable-length integer starting at `start` in `data`.
 ///
@@ -71,9 +75,7 @@ pub fn decode_string(data: &[u8], idx: usize) -> Option<(String, usize)> {
 /// A typed view over the property table of any MQTT v5.0 packet.
 ///
 /// Walks the variable-length property block once on construction and exposes
-/// accessors for the most common fields. Unknown property IDs are tolerated
-/// (the walker advances by the correct length for every defined property and
-/// returns `None` for unrecognized IDs encountered during eager extraction).
+/// accessors for the most common fields.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedProperties {
     pub user_properties: Vec<(String, String)>,
@@ -168,7 +170,19 @@ impl ParsedProperties {
                     props.user_properties.push((key, value));
                     idx = after_value;
                 }
+                id if BYTE_PROPERTIES.contains(&id) => idx += 1,
+                id if TWO_BYTE_PROPERTIES.contains(&id) => idx += 2,
+                id if FOUR_BYTE_PROPERTIES.contains(&id) => idx += 4,
+                id if LENGTH_PREFIXED_PROPERTIES.contains(&id) => {
+                    if idx + 2 > end {
+                        return None;
+                    }
+                    idx += 2 + u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
+                }
                 _ => return None,
+            }
+            if idx > end {
+                return None;
             }
         }
         Some(props)
@@ -319,6 +333,23 @@ mod tests {
         let data = [0x0B, 0x05, 0x0B, 0x07];
         let props = ParsedProperties::parse(&data, 0, data.len()).unwrap();
         assert_eq!(props.subscription_identifiers, vec![5, 7]);
+    }
+
+    #[test]
+    fn parsed_connack_skips_connack_only_properties() {
+        let data = [
+            0x20, 0x13, 0x01, 0x00, 0x10, 0x27, 0x10, 0x00, 0x00, 0x00, 0x22, 0xff, 0xff, 0x28,
+            0x01, 0x25, 0x01, 0x29, 0x01, 0x2a, 0x01,
+        ];
+        let connack = ParsedConnAck::parse(&data).unwrap();
+        assert!(connack.session_present);
+        assert_eq!(connack.reason_code, 0x00);
+    }
+
+    #[test]
+    fn properties_reject_a_truncated_skipped_property() {
+        let data = [0x27, 0x00, 0x01];
+        assert!(ParsedProperties::parse(&data, 0, data.len()).is_none());
     }
 
     #[test]
