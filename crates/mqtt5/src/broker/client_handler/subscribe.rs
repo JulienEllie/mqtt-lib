@@ -478,6 +478,22 @@ impl ClientHandler {
     }
 
     pub(super) async fn handle_flow_closed(&mut self, flow_id: u64) {
+        #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+        if let Some(registry) = self.flow_registry.clone() {
+            let fid = crate::transport::flow::FlowId::from(flow_id);
+            let mut registry = registry.lock().await;
+            if registry
+                .get(fid)
+                .is_some_and(crate::session::quic_flow::FlowState::is_open)
+            {
+                return;
+            }
+            registry.remove(fid);
+        }
+        self.drop_flow_subscriptions(flow_id).await;
+    }
+
+    async fn drop_flow_subscriptions(&mut self, flow_id: u64) {
         let Some(ref client_id) = self.client_id else {
             return;
         };
@@ -519,6 +535,27 @@ impl ClientHandler {
         #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
         if let Some(ref mut ssm) = self.server_stream_manager {
             ssm.remove_flow_stream(flow_id);
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+    pub(super) async fn close_unretained_flows(&mut self) {
+        while let Some(flow_id) = self
+            .flow_closed_rx
+            .as_mut()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.handle_flow_closed(flow_id).await;
+        }
+        let Some(registry) = self.flow_registry.clone() else {
+            return;
+        };
+        let registry = registry.lock().await;
+        for (id, _) in registry
+            .client_flows()
+            .filter(|(_, state)| state.expire_interval.is_none())
+        {
+            self.drop_flow_subscriptions(id.raw()).await;
         }
     }
 
