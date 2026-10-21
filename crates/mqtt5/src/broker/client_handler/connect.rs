@@ -25,9 +25,8 @@ fn clamp_keep_alive_to_u16(keep_alive: Duration) -> u16 {
     let secs = keep_alive.as_secs();
     u16::try_from(secs).unwrap_or_else(|_| {
         warn!(
-            "Configured server_keep_alive {}s exceeds the u16 wire range; clamping to {}s",
-            secs,
-            u16::MAX,
+            "Configured server_keep_alive {secs}s exceeds the u16 wire range; clamping to {}s",
+            u16::MAX
         );
         u16::MAX
     })
@@ -79,6 +78,8 @@ impl ClientHandler {
         self.validate_protocol_version(connect.protocol_version)
             .await?;
 
+        let assigned_client_id = self.assign_client_id_if_empty(&mut connect).await?;
+
         if let Some(redirect) = self.check_load_balancer_redirect(&connect).await? {
             return redirect.map(|()| None);
         }
@@ -97,7 +98,7 @@ impl ClientHandler {
                 addr = %self.client_addr,
                 "Rejecting connection: Maximum Packet Size of 0 is a Protocol Error"
             );
-            let connack = ConnAckPacket::new(false, ReasonCode::ProtocolError);
+            let connack = self.new_connack(false, ReasonCode::ProtocolError);
             self.write_to_client(Packet::ConnAck(connack)).await?;
             return Err(MqttError::ProtocolError(
                 "Maximum Packet Size must not be zero".to_string(),
@@ -105,7 +106,6 @@ impl ClientHandler {
         }
         self.client_max_packet_size = client_max_packet_size;
 
-        let assigned_client_id = Self::assign_client_id_if_empty(&mut connect);
         self.validate_client_id(&connect).await?;
 
         match self
@@ -182,15 +182,7 @@ impl ClientHandler {
         let Some(ref lb) = self.config.load_balancer else {
             return Ok(None);
         };
-        let generated;
-        let client_id = if connect.client_id.is_empty() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static LB_COUNTER: AtomicU64 = AtomicU64::new(0);
-            generated = format!("auto-{}", LB_COUNTER.fetch_add(1, Ordering::Relaxed));
-            &generated
-        } else {
-            &connect.client_id
-        };
+        let client_id = &connect.client_id;
         if let Some(backend) = lb.select_backend(client_id) {
             let backend = backend.to_string();
             info!(
@@ -199,7 +191,8 @@ impl ClientHandler {
                 addr = %self.client_addr,
                 "Redirecting client to backend"
             );
-            let connack = ConnAckPacket::new(false, ReasonCode::UseAnotherServer)
+            let connack = self
+                .new_connack(false, ReasonCode::UseAnotherServer)
                 .with_server_reference(backend);
             self.write_to_client(Packet::ConnAck(connack)).await?;
             return Ok(Some(Err(MqttError::UseAnotherServer)));
@@ -207,17 +200,35 @@ impl ClientHandler {
         Ok(None)
     }
 
-    fn assign_client_id_if_empty(connect: &mut ConnectPacket) -> Option<String> {
-        if connect.client_id.is_empty() {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let generated_id = format!("auto-{}", COUNTER.fetch_add(1, Ordering::SeqCst));
-            debug!("Generated client ID '{}' for empty client ID", generated_id);
-            connect.client_id.clone_from(&generated_id);
-            Some(generated_id)
-        } else {
-            None
+    async fn assign_client_id_if_empty(
+        &mut self,
+        connect: &mut ConnectPacket,
+    ) -> Result<Option<String>> {
+        if !connect.client_id.is_empty() {
+            return Ok(None);
         }
+        if self.protocol_version == 4 && !connect.clean_start {
+            warn!(
+                addr = %self.client_addr,
+                "Rejecting connection: empty client ID without CleanSession"
+            );
+            let connack = self.new_connack(false, ReasonCode::ClientIdentifierNotValid);
+            self.write_to_client(Packet::ConnAck(connack)).await?;
+            return Err(MqttError::InvalidClientId(String::new()));
+        }
+        let mut random = [0u8; 16];
+        if let Err(e) = getrandom::fill(&mut random) {
+            warn!(addr = %self.client_addr, "Cannot assign a client ID: {e}");
+            let connack = self.new_connack(false, ReasonCode::ServerUnavailable);
+            self.write_to_client(Packet::ConnAck(connack)).await?;
+            return Err(MqttError::Io(format!(
+                "failed to generate a client ID: {e}"
+            )));
+        }
+        let generated_id = format!("auto-{:032x}", u128::from_be_bytes(random));
+        debug!("Generated client ID '{generated_id}' for empty client ID");
+        connect.client_id.clone_from(&generated_id);
+        Ok(Some(generated_id))
     }
 
     async fn validate_client_id(&mut self, connect: &ConnectPacket) -> Result<()> {
@@ -227,7 +238,7 @@ impl ClientHandler {
                 addr = %self.client_addr,
                 "Rejecting connection: invalid client identifier"
             );
-            let connack = ConnAckPacket::new(false, ReasonCode::ClientIdentifierNotValid);
+            let connack = self.new_connack(false, ReasonCode::ClientIdentifierNotValid);
             self.write_to_client(Packet::ConnAck(connack)).await?;
             return Err(MqttError::InvalidClientId(connect.client_id.clone()));
         }
@@ -239,7 +250,7 @@ impl ClientHandler {
                 addr = %self.client_addr,
                 "Rejecting cert: client ID on connection without verified client certificate"
             );
-            let connack = ConnAckPacket::new(false, ReasonCode::NotAuthorized);
+            let connack = self.new_connack(false, ReasonCode::NotAuthorized);
             self.write_to_client(Packet::ConnAck(connack)).await?;
             return Err(MqttError::AuthenticationFailed);
         }
@@ -487,7 +498,7 @@ impl ClientHandler {
                     current_user = ?self.user_id,
                     "Session user mismatch, rejecting connection"
                 );
-                let connack = ConnAckPacket::new(false, ReasonCode::NotAuthorized);
+                let connack = self.new_connack(false, ReasonCode::NotAuthorized);
                 self.write_to_client(Packet::ConnAck(connack)).await?;
                 return Err(MqttError::AuthenticationFailed);
             }

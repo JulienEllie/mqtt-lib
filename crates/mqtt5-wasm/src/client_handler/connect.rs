@@ -59,20 +59,33 @@ impl WasmClientHandler {
         }
         self.protocol_version = connect.protocol_version;
 
-        self.check_load_balancer_redirect(&connect, writer)?;
-
         let mut assigned_client_id = None;
         if connect.client_id.is_empty() {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static COUNTER: AtomicU32 = AtomicU32::new(0);
-            let generated_id = format!("wasm-auto-{}", COUNTER.fetch_add(1, Ordering::SeqCst));
-            debug!("Generated client ID '{}' for empty client ID", generated_id);
+            if self.protocol_version == 4 && !connect.clean_start {
+                warn!("Rejecting connection: empty client ID without CleanSession");
+                let connack = self.new_connack(false, ReasonCode::ClientIdentifierNotValid);
+                self.write_packet(&Packet::ConnAck(connack), writer)?;
+                return Err(MqttError::InvalidClientId(String::new()));
+            }
+            let mut random = [0u8; 16];
+            if let Err(e) = getrandom::fill(&mut random) {
+                warn!("Cannot assign a client ID: {e}");
+                let connack = self.new_connack(false, ReasonCode::ServerUnavailable);
+                self.write_packet(&Packet::ConnAck(connack), writer)?;
+                return Err(MqttError::Io(format!(
+                    "failed to generate a client ID: {e}"
+                )));
+            }
+            let generated_id = format!("wasm-auto-{:032x}", u128::from_be_bytes(random));
+            debug!("Generated client ID '{generated_id}' for empty client ID");
             connect.client_id.clone_from(&generated_id);
             assigned_client_id = Some(generated_id);
         }
 
+        self.check_load_balancer_redirect(&connect, writer)?;
+
         if !mqtt5_protocol::is_path_safe_client_id(&connect.client_id) {
-            let connack = ConnAckPacket::new(false, ReasonCode::ClientIdentifierNotValid);
+            let connack = self.new_connack(false, ReasonCode::ClientIdentifierNotValid);
             self.write_packet(&Packet::ConnAck(connack), writer)?;
             return Err(MqttError::InvalidClientId(connect.client_id));
         }
@@ -116,8 +129,7 @@ impl WasmClientHandler {
             .await?;
 
         if !auth_result.authenticated {
-            let mut connack = ConnAckPacket::new(false, auth_result.reason_code);
-            connack.protocol_version = self.protocol_version;
+            let connack = self.new_connack(false, auth_result.reason_code);
             self.write_packet(&Packet::ConnAck(connack), writer)?;
             return Err(MqttError::AuthenticationFailed);
         }
@@ -131,8 +143,7 @@ impl WasmClientHandler {
 
         let session_present = self.handle_session(&connect, writer).await?;
 
-        let mut connack = ConnAckPacket::new(session_present, ReasonCode::Success);
-        connack.protocol_version = self.protocol_version;
+        let mut connack = self.new_connack(session_present, ReasonCode::Success);
 
         if self.protocol_version == 5 {
             if let Some(ref assigned_id) = assigned_client_id {
@@ -154,6 +165,14 @@ impl WasmClientHandler {
             self.advance_packet_id_past_inflight();
         }
         Ok(())
+    }
+
+    fn new_connack(&self, session_present: bool, reason_code: ReasonCode) -> ConnAckPacket {
+        if self.protocol_version == 4 {
+            ConnAckPacket::new_v311(session_present, reason_code)
+        } else {
+            ConnAckPacket::new(session_present, reason_code)
+        }
     }
 
     pub(super) fn maximum_session_expiry(&self) -> u32 {
@@ -188,7 +207,7 @@ impl WasmClientHandler {
                     current_user = ?self.user_id,
                     "Session user mismatch, rejecting connection"
                 );
-                let connack = ConnAckPacket::new(false, ReasonCode::NotAuthorized);
+                let connack = self.new_connack(false, ReasonCode::NotAuthorized);
                 self.write_packet(&Packet::ConnAck(connack), writer)?;
                 return Err(MqttError::AuthenticationFailed);
             }
@@ -220,8 +239,7 @@ impl WasmClientHandler {
         if let Err(e) = self.storage.store_session(session.clone()).await {
             drop(slot);
             warn!(client_id = %client_id, "Failed to store the claimed session: {e}");
-            let mut connack = ConnAckPacket::new(false, ReasonCode::ServerUnavailable);
-            connack.protocol_version = self.protocol_version;
+            let connack = self.new_connack(false, ReasonCode::ServerUnavailable);
             self.write_packet(&Packet::ConnAck(connack), writer)?;
             return Err(e);
         }
@@ -299,8 +317,7 @@ impl WasmClientHandler {
 
                     let session_present = self.handle_session(&pending.connect, writer).await?;
 
-                    let mut connack = ConnAckPacket::new(session_present, ReasonCode::Success);
-                    connack.protocol_version = self.protocol_version;
+                    let mut connack = self.new_connack(session_present, ReasonCode::Success);
                     if let Some(ref assigned_id) = pending.assigned_client_id {
                         connack
                             .properties
@@ -348,8 +365,7 @@ impl WasmClientHandler {
                 self.auth_state = AuthState::NotStarted;
                 self.pending_connect = None;
 
-                let mut connack = ConnAckPacket::new(false, result.reason_code);
-                connack.protocol_version = self.protocol_version;
+                let connack = self.new_connack(false, result.reason_code);
                 self.write_packet(&Packet::ConnAck(connack), writer)?;
                 Err(MqttError::AuthenticationFailed)
             }
@@ -363,15 +379,7 @@ impl WasmClientHandler {
     ) -> Result<()> {
         if let Ok(config) = self.config.read() {
             if let Some(ref lb) = config.load_balancer {
-                let generated;
-                let client_id = if connect.client_id.is_empty() {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static LB_COUNTER: AtomicU64 = AtomicU64::new(0);
-                    generated = format!("auto-{}", LB_COUNTER.fetch_add(1, Ordering::Relaxed));
-                    &generated
-                } else {
-                    &connect.client_id
-                };
+                let client_id = &connect.client_id;
                 if let Some(backend) = lb.select_backend(client_id) {
                     let backend = backend.to_string();
                     info!(
@@ -379,7 +387,8 @@ impl WasmClientHandler {
                         backend = %backend,
                         "Redirecting client to backend"
                     );
-                    let connack = ConnAckPacket::new(false, ReasonCode::UseAnotherServer)
+                    let connack = self
+                        .new_connack(false, ReasonCode::UseAnotherServer)
                         .with_server_reference(backend);
                     self.write_packet(&Packet::ConnAck(connack), writer)?;
                     return Err(MqttError::UseAnotherServer);
@@ -397,16 +406,14 @@ impl WasmClientHandler {
         if let Some(ref will) = connect.will {
             if let Ok(config) = self.config.read() {
                 if (will.qos as u8) > config.maximum_qos {
-                    let mut connack = ConnAckPacket::new(false, ReasonCode::QoSNotSupported);
-                    connack.protocol_version = self.protocol_version;
+                    let connack = self.new_connack(false, ReasonCode::QoSNotSupported);
                     self.write_packet(&Packet::ConnAck(connack), writer)?;
                     return Err(MqttError::ProtocolError(
                         "Will QoS exceeds server maximum".to_string(),
                     ));
                 }
                 if will.retain && !config.retain_available {
-                    let mut connack = ConnAckPacket::new(false, ReasonCode::RetainNotSupported);
-                    connack.protocol_version = self.protocol_version;
+                    let connack = self.new_connack(false, ReasonCode::RetainNotSupported);
                     self.write_packet(&Packet::ConnAck(connack), writer)?;
                     return Err(MqttError::ProtocolError("Retain not supported".to_string()));
                 }
