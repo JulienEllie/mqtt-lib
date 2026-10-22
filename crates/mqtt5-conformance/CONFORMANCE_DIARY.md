@@ -39,6 +39,38 @@
 
 ## Diary Entries
 
+### QUIC buffer budget reservations (2026-10-22)
+
+**Trigger**: second review of PR #263.
+
+**Behavior with the byte counter**: a reader gave its bytes back as soon as it decoded a packet, while the packet still waited in the client handler's 100-slot input queue. With `max_packet_size` 512 KB, a broker stream receive window of 64 KB, and a client subscribed to its own topic that never reads its deliveries (so its handler blocks writing to it), one data flow got 100 complete 200 KB packets read in a row, the most the test sends. Origin/main reads the same 100. Separately, a client writing large packets one after another on new streams was disconnected, because `write_all` returns before the broker has read the previous packet and two packets briefly overlapped.
+
+**Fix**: the budget is a semaphore of `max_packet_size` permits. A reader that sees a fixed header announcing more than 4096 bytes acquires that many permits before reading the rest, and the permit travels with the decoded packet through `ExternalInput::Packet` until the handler has processed it. A reader waiting for permits stops reading, so QUIC flow control slows the client down. Readers holding permits only need the network to finish, so waiting cannot deadlock. Packets of 4096 bytes or less are not reserved, since a reader already holds up to one 4096-byte read chunk uncounted; this keeps PINGREQ and acks on the control stream from waiting behind a large data packet, which the first version of these tests caught. The budget is closed when the handler ends, so waiting readers stop. Going over the budget no longer closes the connection.
+
+**Tests**: `a_stalled_handler_stops_reading_once_queued_packets_fill_the_maximum_size` reads 4 packets here and 100 on main and on the byte-counter commit. The three `partial_packets_..._wait_for_each_other` tests (data and data, control and data, control and ack stream) leave two partial packets over the budget, check the connection stays open, finish both, and check both get through; they fail on the byte-counter commit, where the connection is closed, and pass on main, which has no budget. `an_abandoned_packet_releases_its_reservation` resets a stream holding a reservation and checks a later packet is delivered. A unit test covers reservation, waiting, release and close.
+
+### QUIC buffer budget review fixes (2026-10-22)
+
+**Trigger**: review of PR #263.
+
+**Behavior with the first fix**: a stream's read buffer reserved the full size its fixed header announced as soon as the header arrived, while the budget counted only the bytes received. A unit test feeding `decode_buffered_packet` the five bytes `30 FF FF FF 7F` (a PUBLISH announcing 268435455 bytes) left the buffer with at least that much capacity, so a client could still make the broker reserve close to `max_packet_size` per stream by sending only headers.
+
+**Fix**: `decode_buffered_packet` no longer reserves for the announced size. A buffer now grows with the bytes that arrive, which the budget counts. Going over the budget now returns a `ProtocolError` that names the bytes held across the connection's streams instead of `PacketTooLarge`, which read as one oversized packet. The close code is still ERROR_PROTOCOL_L0.
+
+**Tests**: `an_announced_size_does_not_allocate_before_its_bytes_arrive` fails before the fix and passes after. `complete_and_abandoned_packets_free_the_connection_buffer` now waits for each full packet to be delivered to a subscriber before sending the next, since three full packets read at once could legitimately go over the budget. The reset half of that test still waits on fixed delays, because the broker gives no signal when a reader releases its share.
+
+### QUIC per-connection buffer budget (2026-10-21)
+
+**Trigger**: #236.
+
+**Spec**: nothing in MQTT 5 or MQoQ is broken here, since every packet is held to the `max_packet_size` the broker announces. The concern is memory: a QUIC connection has many streams, each with its own read buffer, while a TCP connection has one.
+
+**Behavior on main**, with a raw QUIC client and `max_packet_size` 1024: two data streams each sending 612 bytes of a 1024-byte PUBLISH, or 612 bytes on the control stream and 612 on a data stream, leave the connection open.
+
+**Fix**: one budget per connection, equal to `max_packet_size`, shared by the control stream (read by the client handler), every client data stream reader, and the ack readers on streams the broker opens. Each reader holds a share sized to the bytes in its buffer, updated after every read and every decoded packet, and released when the reader ends. Going over the budget is reported as `PacketTooLarge` and closes the connection with ERROR_PROTOCOL_L0, the same way an oversized packet does. A connection can still send any single packet up to `max_packet_size`.
+
+**Tests**: `partial_packets_on_data_streams_over_the_maximum_size_close_the_connection`, `partial_packets_on_the_control_and_a_data_stream_over_the_maximum_size_close_the_connection` and `partial_packets_on_the_control_and_an_ack_stream_over_the_maximum_size_close_the_connection` fail on main and pass with the fix. `complete_and_abandoned_packets_free_the_connection_buffer` (three full-size packets on three streams, then a partial packet on a stream that is reset, then another partial packet) passes on both, and checks that complete packets and ended streams give their bytes back. A unit test covers the share accounting.
+
 ### QUIC server flow IDs for flow-bound delivery (2026-10-21)
 
 **Trigger**: #253.

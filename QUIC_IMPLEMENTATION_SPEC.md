@@ -287,6 +287,8 @@ The broker spawns three concurrent tasks per QUIC connection: a **client handler
 
 Data stream readers detect flow headers by inspecting the first byte (0x11-0x13). A reader sends a client data flow header to the client handler and waits for its answer before it reads the stream's packets, and reports the end of the stream on the same channel as the packets.
 
+The control stream, client data streams and the return direction of streams the broker opens share one budget per connection, equal to `max_packet_size`. A reader that sees a fixed header announcing more than 4096 bytes reserves that size from the budget before it reads the rest, and waits while the budget is taken. The reservation is held until the client handler has processed the packet, including while it waits in the handler's input queue. A waiting reader stops reading its stream, so QUIC flow control slows the client down instead of the broker buffering more. Packets of 4096 bytes or less are not reserved, so pings and acks are never held behind a large packet.
+
 ### Internal Types
 
 #### StreamStrategy (Client)

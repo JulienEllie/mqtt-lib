@@ -13,7 +13,7 @@ use crate::transport::flow::{
     FlowFlags, FlowHeader, FlowId, FLOW_TYPE_CLIENT_DATA, FLOW_TYPE_CONTROL, FLOW_TYPE_SERVER_DATA,
     FLOW_TYPE_USER_DEFINED,
 };
-use crate::transport::packet_io::decode_buffered_packet;
+use crate::transport::packet_io::{read_packet_within_budget, ChunkReader, ReadBudget};
 use bytes::{Buf, Bytes, BytesMut};
 use mqtt5_protocol::QuicStreamCode;
 use quinn::{Connection, Endpoint, RecvStream, SendStream, ServerConfig};
@@ -296,10 +296,10 @@ pub async fn accept_quic_connection(
     ))?;
 
     let peer_addr = incoming.remote_address();
-    debug!("Incoming QUIC connection from {}", peer_addr);
+    debug!("Incoming QUIC connection from {peer_addr}");
 
     let connection = incoming.await.map_err(|e| {
-        error!("QUIC connection failed from {}: {}", peer_addr, e);
+        error!("QUIC connection failed from {peer_addr}: {e}");
         MqttError::ConnectionError(format!("QUIC handshake failed: {e}"))
     })?;
 
@@ -327,7 +327,7 @@ pub async fn accept_quic_stream(
         MqttError::ConnectionError(format!("Failed to accept QUIC stream: {reason}"))
     })?;
 
-    debug!("QUIC bidirectional stream accepted from {}", peer_addr);
+    debug!("QUIC bidirectional stream accepted from {peer_addr}");
 
     Ok(QuicStreamWrapper::new(send, recv, peer_addr))
 }
@@ -445,26 +445,13 @@ fn build_flow_header_result(flow_header: FlowHeader, leftover: BytesMut) -> Stre
     }
 }
 
-pub(super) async fn read_packet_with_buffer(
-    recv: &mut RecvStream,
-    buffer: &mut BytesMut,
-    protocol_version: u8,
-    max_packet_size: usize,
-) -> Result<Packet> {
-    loop {
-        if let Some(packet) = decode_buffered_packet(buffer, protocol_version, max_packet_size)? {
-            return Ok(packet);
-        }
-        let mut chunk = [0u8; 1024];
-        let n = recv
-            .read(&mut chunk)
+impl ChunkReader for RecvStream {
+    async fn read_chunk(&mut self, chunk: &mut [u8]) -> Result<usize> {
+        Ok(self
+            .read(chunk)
             .await
             .map_err(|e| MqttError::ConnectionError(format!("QUIC read error: {e}")))?
-            .ok_or(MqttError::ClientClosed)?;
-        if n == 0 {
-            return Err(MqttError::ClientClosed);
-        }
-        buffer.extend_from_slice(&chunk[..n]);
+            .unwrap_or(0))
     }
 }
 
@@ -515,16 +502,14 @@ async fn run_quic_handler_inner(
         }
     };
 
-    debug!(
-        "{} control stream accepted from {}, starting handler",
-        label, peer_addr
-    );
+    debug!("{label} control stream accepted from {peer_addr}, starting handler");
 
     let stream = QuicStreamWrapper::new(send, recv, peer_addr);
     let transport = BrokerTransport::quic(stream);
 
     let delivery_strategy = context.config.server_delivery_strategy;
     let max_packet_size = context.config.max_packet_size;
+    let read_budget = ReadBudget::new(max_packet_size);
     let connection_alive = context.connection_alive;
     let handler = ClientHandler::new_with_external_packets(
         transport,
@@ -541,19 +526,22 @@ async fn run_quic_handler_inner(
     .with_quic_connection(connection.clone())
     .with_server_delivery_strategy(delivery_strategy)
     .with_quic_packet_tx(packet_tx.clone())
+    .with_read_budget(&read_budget)
     .with_quic_protocol_version_tx(protocol_version_tx)
     .with_skip_bridge_forwarding(skip_bridge_forwarding);
 
     let handler_label = label;
     let handler_connection = connection.clone();
+    let handler_budget = read_budget.clone();
     tokio::spawn(async move {
         let outcome = handler.run().await;
+        handler_budget.close();
         drop(connection_alive);
         if let Err(e) = &outcome {
             if e.is_normal_disconnect() {
-                debug!("{} client handler finished", handler_label);
+                debug!("{handler_label} client handler finished");
             } else {
-                warn!("{} client handler error: {e}", handler_label);
+                warn!("{handler_label} client handler error: {e}");
             }
         }
         close_after_control_flow(&handler_connection, peer_addr, &outcome).await;
@@ -576,6 +564,7 @@ async fn run_quic_handler_inner(
             protocol_version_rx,
             peer_addr,
             max_packet_size,
+            read_budget,
         },
         label,
     );
@@ -669,9 +658,7 @@ fn spawn_datagram_reader(
                 Ok(datagram) => {
                     trace!(
                         len = datagram.len(),
-                        "Received {} datagram from {}",
-                        label,
-                        peer_addr
+                        "Received {label} datagram from {peer_addr}"
                     );
                     let packet = match decode_datagram_packet(
                         &datagram,
@@ -686,16 +673,16 @@ fn spawn_datagram_reader(
                         None => continue,
                     };
                     if packet_tx
-                        .send(ExternalInput::Packet(packet, None))
+                        .send(ExternalInput::Packet(packet, None, None))
                         .await
                         .is_err()
                     {
-                        debug!("Datagram packet channel closed for {}", peer_addr);
+                        debug!("Datagram packet channel closed for {peer_addr}");
                         break;
                     }
                 }
                 Err(e) => {
-                    debug!("Datagram read ended for {}: {}", peer_addr, e);
+                    debug!("Datagram read ended for {peer_addr}: {e}");
                     break;
                 }
             }
@@ -713,7 +700,7 @@ fn spawn_bi_accept_loop(
         loop {
             match connection.accept_bi().await {
                 Ok((send, recv)) => {
-                    debug!("{} bidirectional stream accepted from {}", label, peer_addr);
+                    debug!("{label} bidirectional stream accepted from {peer_addr}");
                     spawn_bi_stream_handler(send, recv, peer_addr, packet_tx.clone());
                 }
                 Err(e) => {
@@ -733,6 +720,7 @@ struct DataStreamContext {
     protocol_version_rx: watch::Receiver<Option<u8>>,
     peer_addr: SocketAddr,
     max_packet_size: usize,
+    read_budget: ReadBudget,
 }
 
 fn spawn_uni_accept_loop(context: DataStreamContext, label: &'static str) {
@@ -937,21 +925,69 @@ async fn open_flow(
     answered.await.ok()
 }
 
+async fn read_data_stream_packets(
+    recv: &mut RecvStream,
+    mut buffer: BytesMut,
+    flow_id: Option<FlowId>,
+    protocol_version: u8,
+    context: &DataStreamContext,
+) -> bool {
+    let peer_addr = context.peer_addr;
+    let mut share = context.read_budget.share();
+    loop {
+        match read_packet_within_budget(
+            recv,
+            protocol_version,
+            &mut buffer,
+            context.max_packet_size,
+            Some(&mut share),
+        )
+        .await
+        {
+            Ok((packet, permit)) => {
+                let raw_flow_id = flow_id.map(|f| f.raw());
+                debug!(flow_id = ?flow_id, packet_type = %packet.packet_type_name(), "Read packet from QUIC data stream");
+                if context
+                    .packet_tx
+                    .send(ExternalInput::Packet(packet, raw_flow_id, permit))
+                    .await
+                    .is_err()
+                {
+                    debug!("Packet channel closed, stopping data stream reader");
+                    return false;
+                }
+            }
+            Err(MqttError::ClientClosed) if buffer.is_empty() => {
+                debug!(flow_id = ?flow_id, "QUIC data stream closed from {peer_addr}");
+                return true;
+            }
+            Err(MqttError::ClientClosed) => {
+                warn!(flow_id = ?flow_id, "QUIC data stream from {peer_addr} ended inside a packet");
+                return false;
+            }
+            Err(MqttError::ConnectionError(reason)) => {
+                debug!(flow_id = ?flow_id, "QUIC data stream from {peer_addr} ended: {reason}");
+                return false;
+            }
+            Err(e) => {
+                close_on_protocol_error(&context.connection, peer_addr, "data stream", &e);
+                return false;
+            }
+        }
+    }
+}
+
 fn spawn_data_stream_reader(context: DataStreamContext, mut recv: RecvStream) {
     tokio::spawn(async move {
-        let DataStreamContext {
-            connection,
-            packet_tx,
-            protocol_version_rx,
-            peer_addr,
-            max_packet_size,
-        } = context;
-        let Some(protocol_version) = negotiated_protocol_version(protocol_version_rx).await else {
+        let peer_addr = context.peer_addr;
+        let Some(protocol_version) =
+            negotiated_protocol_version(context.protocol_version_rx.clone()).await
+        else {
             debug!("client handler ended before CONNECT from {peer_addr}");
             return;
         };
         let stream_id = u64::from(recv.id());
-        let (flow_id, mut buffer) = match try_read_flow_header(&mut recv).await {
+        let (flow_id, buffer) = match try_read_flow_header(&mut recv).await {
             Ok(StreamOpening::Refused(code)) => {
                 stop_data_stream(&mut recv, peer_addr, code);
                 return;
@@ -961,9 +997,9 @@ fn spawn_data_stream_reader(context: DataStreamContext, mut recv: RecvStream) {
                 flags: Some(flags),
                 expire,
                 leftover,
-            })) => match open_flow(&packet_tx, id, stream_id, flags, expire).await {
+            })) => match open_flow(&context.packet_tx, id, stream_id, flags, expire).await {
                 Some(FlowAnswer::Served) => {
-                    debug!(flow_id = ?id, "Serving flow from {}", peer_addr);
+                    debug!(flow_id = ?id, "Serving flow from {peer_addr}");
                     (Some(id), leftover)
                 }
                 Some(FlowAnswer::Refused(code)) => {
@@ -972,7 +1008,7 @@ fn spawn_data_stream_reader(context: DataStreamContext, mut recv: RecvStream) {
                 }
                 Some(FlowAnswer::Close(code)) => {
                     warn!(flow_id = ?id, %code, "closing QUIC connection from {peer_addr}");
-                    close_connection(&connection, code);
+                    close_connection(&context.connection, code);
                     return;
                 }
                 None => {
@@ -981,49 +1017,17 @@ fn spawn_data_stream_reader(context: DataStreamContext, mut recv: RecvStream) {
                 }
             },
             Ok(StreamOpening::Flow(result)) => {
-                trace!("No flow header on data stream from {}", peer_addr);
+                trace!("No flow header on data stream from {peer_addr}");
                 (None, result.leftover)
             }
             Err(e) => {
-                warn!("Error parsing flow header from {}: {}", peer_addr, e);
+                warn!("Error parsing flow header from {peer_addr}: {e}");
                 return;
             }
         };
 
-        let graceful = loop {
-            match read_packet_with_buffer(&mut recv, &mut buffer, protocol_version, max_packet_size)
-                .await
-            {
-                Ok(packet) => {
-                    let raw_flow_id = flow_id.map(|f| f.raw());
-                    debug!(flow_id = ?flow_id, packet_type = %packet.packet_type_name(), "Read packet from QUIC data stream");
-                    if packet_tx
-                        .send(ExternalInput::Packet(packet, raw_flow_id))
-                        .await
-                        .is_err()
-                    {
-                        debug!("Packet channel closed, stopping data stream reader");
-                        break false;
-                    }
-                }
-                Err(MqttError::ClientClosed) if buffer.is_empty() => {
-                    debug!(flow_id = ?flow_id, "QUIC data stream closed from {}", peer_addr);
-                    break true;
-                }
-                Err(MqttError::ClientClosed) => {
-                    warn!(flow_id = ?flow_id, "QUIC data stream from {peer_addr} ended inside a packet");
-                    break false;
-                }
-                Err(MqttError::ConnectionError(reason)) => {
-                    debug!(flow_id = ?flow_id, "QUIC data stream from {peer_addr} ended: {reason}");
-                    break false;
-                }
-                Err(e) => {
-                    close_on_protocol_error(&connection, peer_addr, "data stream", &e);
-                    break false;
-                }
-            }
-        };
+        let graceful =
+            read_data_stream_packets(&mut recv, buffer, flow_id, protocol_version, &context).await;
 
         if let Some(id) = flow_id {
             let ended = FlowInput::Ended {
@@ -1031,7 +1035,12 @@ fn spawn_data_stream_reader(context: DataStreamContext, mut recv: RecvStream) {
                 stream_id,
                 graceful,
             };
-            if packet_tx.send(ExternalInput::Flow(ended)).await.is_err() {
+            if context
+                .packet_tx
+                .send(ExternalInput::Flow(ended))
+                .await
+                .is_err()
+            {
                 debug!(flow_id = ?id, "client handler ended before the flow did");
             }
         }

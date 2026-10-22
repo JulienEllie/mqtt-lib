@@ -25,7 +25,11 @@ use crate::packet::Packet;
 use crate::protocol::v5::properties::Properties;
 use crate::protocol::v5::reason_codes::ReasonCode;
 use crate::time::Duration;
-use crate::transport::packet_io::{encode_packet_to_buffer, read_packet_reusing_buffer};
+#[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+use crate::transport::packet_io::ReadBudget;
+use crate::transport::packet_io::{
+    encode_packet_to_buffer, read_packet_within_budget, ReadPermit, ReadShare,
+};
 use crate::transport::PacketIo;
 use bytes::{Bytes, BytesMut};
 use mqtt5_protocol::KeepaliveConfig;
@@ -60,7 +64,7 @@ use crate::broker::server_stream_manager::ServerStreamManager;
 
 #[derive(Debug)]
 pub enum ExternalInput {
-    Packet(Packet, Option<u64>),
+    Packet(Packet, Option<u64>, Option<ReadPermit>),
     #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
     Flow(crate::broker::quic_flows::FlowInput),
 }
@@ -164,6 +168,7 @@ pub struct ClientHandler {
     pub(super) protocol_version: u8,
     pub(super) write_buffer: BytesMut,
     pub(super) read_buffer: BytesMut,
+    pub(super) read_share: Option<ReadShare>,
     pub(super) skip_bridge_forwarding: bool,
     pub(super) pending_target_flow: Option<u64>,
     pub(super) flow_deadline: Option<Instant>,
@@ -282,6 +287,7 @@ impl ClientHandler {
             protocol_version: 5,
             write_buffer: BytesMut::with_capacity(4096),
             read_buffer: BytesMut::with_capacity(4096),
+            read_share: None,
             skip_bridge_forwarding: false,
             pending_target_flow: None,
             flow_deadline: None,
@@ -323,6 +329,13 @@ impl ClientHandler {
     #[must_use]
     pub fn with_quic_packet_tx(mut self, tx: mpsc::Sender<ExternalInput>) -> Self {
         self.quic_packet_tx = Some(tx);
+        self
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
+    #[must_use]
+    pub(crate) fn with_read_budget(mut self, budget: &ReadBudget) -> Self {
+        self.read_share = Some(budget.share());
         self
     }
 
@@ -429,7 +442,7 @@ impl ClientHandler {
 
         self.handle_disconnect_cleanup(&client_id, armed_will).await;
 
-        info!("Client {} disconnected", client_id);
+        info!("Client {client_id} disconnected");
 
         result
     }
@@ -543,10 +556,10 @@ impl ClientHandler {
         if let Err(e) = completed {
             if e.to_string().contains("Connection closed") {
                 info!("Client disconnected during connect phase: {e}");
-                tracing::debug!("Connection closed error details: {:?}", e);
+                tracing::debug!("Connection closed error details: {e:?}");
             } else {
                 warn!("Connect error: {e}");
-                tracing::debug!("Connect error details: {:?}", e);
+                tracing::debug!("Connect error details: {e:?}");
             }
             return Err(e);
         }
@@ -556,13 +569,12 @@ impl ClientHandler {
             ));
         };
         info!(
-            "Client {} connected from {} ({})",
-            client_id,
+            "Client {client_id} connected from {} ({})",
             self.client_addr,
             self.transport.transport_type()
         );
         if let Some(cert_info) = self.transport.client_cert_info() {
-            debug!("Client certificate: {}", cert_info);
+            debug!("Client certificate: {cert_info}");
         }
 
         self.resource_monitor
@@ -686,10 +698,9 @@ impl ClientHandler {
             .release_client(client_id, self.generation, self.session_preserved())
             .await;
         match release {
-            Release::Owned => info!("Unregistered client {} from the router", client_id),
+            Release::Owned => info!("Unregistered client {client_id} from the router"),
             Release::Displaced => info!(
-                "Client {} router entry now belongs to the connection that took it over",
-                client_id
+                "Client {client_id} router entry now belongs to the connection that took it over"
             ),
         }
         release
@@ -807,11 +818,30 @@ impl ClientHandler {
         }
     }
 
+    async fn read_control_packet(
+        transport: &mut BrokerTransport,
+        protocol_version: u8,
+        read_buffer: &mut BytesMut,
+        max_size: usize,
+        share: Option<&mut ReadShare>,
+    ) -> Result<Packet> {
+        let (packet, permit) =
+            read_packet_within_budget(transport, protocol_version, read_buffer, max_size, share)
+                .await?;
+        drop(permit);
+        Ok(packet)
+    }
+
     async fn negotiate_connect(&mut self) -> Result<PendingConnect> {
         let max_size = self.max_packet_size();
-        let packet =
-            read_packet_reusing_buffer(&mut self.transport, 5, &mut self.read_buffer, max_size)
-                .await?;
+        let packet = Self::read_control_packet(
+            &mut self.transport,
+            5,
+            &mut self.read_buffer,
+            max_size,
+            self.read_share.as_mut(),
+        )
+        .await?;
         let Packet::Connect(connect) = packet else {
             return Err(MqttError::ProtocolError(
                 "Expected CONNECT packet".to_string(),
@@ -835,11 +865,12 @@ impl ClientHandler {
         }
         loop {
             let max_size = self.max_packet_size();
-            let packet = read_packet_reusing_buffer(
+            let packet = Self::read_control_packet(
                 &mut self.transport,
                 self.protocol_version,
                 &mut self.read_buffer,
                 max_size,
+                self.read_share.as_mut(),
             )
             .await?;
             let Packet::Auth(auth) = packet else {
@@ -1042,7 +1073,7 @@ impl ClientHandler {
                     self.bind().await?;
                 }
 
-                read_result = timeout(read_timeout, read_packet_reusing_buffer(&mut self.transport, self.protocol_version, &mut self.read_buffer, max_size)) => {
+                read_result = timeout(read_timeout, Self::read_control_packet(&mut self.transport, self.protocol_version, &mut self.read_buffer, max_size, self.read_share.as_mut())) => {
                     if let Some(exit) = self.handle_read(read_result, read_timeout).await? {
                         return Ok(exit);
                     }
@@ -1138,9 +1169,9 @@ impl ClientHandler {
         &mut self,
         external_packet: Option<ExternalInput>,
     ) -> Result<bool> {
-        let (packet, flow_id) = match external_packet {
+        let (packet, flow_id, permit) = match external_packet {
             None => return Ok(false),
-            Some(ExternalInput::Packet(packet, flow_id)) => (packet, flow_id),
+            Some(ExternalInput::Packet(packet, flow_id, permit)) => (packet, flow_id, permit),
             #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
             Some(ExternalInput::Flow(input)) => {
                 self.handle_flow_input(input).await;
@@ -1149,6 +1180,7 @@ impl ClientHandler {
         };
         self.pending_external_flow_id = flow_id;
         let result = self.handle_packet(packet).await;
+        drop(permit);
         self.pending_external_flow_id = None;
         result.map(|()| true)
     }
@@ -1181,7 +1213,7 @@ impl ClientHandler {
         read_timeout: Duration,
     ) -> Result<Option<LoopExit>> {
         let packet_result = read_result.map_err(|_| {
-            warn!("Read timeout (no data for {:?})", read_timeout);
+            warn!("Read timeout (no data for {read_timeout:?})");
             MqttError::Timeout
         })?;
         match packet_result {

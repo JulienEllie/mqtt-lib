@@ -9,8 +9,10 @@ use crate::transport::tls::{TlsReadHalf, TlsWriteHalf};
 use crate::Transport;
 use bytes::{Buf, BufMut, BytesMut};
 use std::future::Future;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Extension trait for Transport to add packet I/O methods
 pub trait PacketIo: Transport {
@@ -298,6 +300,76 @@ pub fn encode_packet_to_buffer(packet: &Packet, buf: &mut BytesMut) -> Result<()
 
 const READ_CHUNK: usize = 4096;
 
+#[derive(Clone, Debug)]
+pub(crate) struct ReadBudget {
+    permits: Arc<Semaphore>,
+    limit: usize,
+}
+
+impl ReadBudget {
+    #[cfg(feature = "transport-quic")]
+    #[must_use]
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(limit)),
+            limit,
+        }
+    }
+
+    #[cfg(feature = "transport-quic")]
+    #[must_use]
+    pub(crate) fn share(&self) -> ReadShare {
+        ReadShare {
+            budget: self.clone(),
+            reserved: None,
+        }
+    }
+
+    #[cfg(feature = "transport-quic")]
+    pub(crate) fn close(&self) {
+        self.permits.close();
+    }
+}
+
+pub type ReadPermit = OwnedSemaphorePermit;
+
+#[derive(Debug)]
+pub(crate) struct ReadShare {
+    budget: ReadBudget,
+    reserved: Option<ReadPermit>,
+}
+
+impl ReadShare {
+    #[cfg(feature = "transport-quic")]
+    pub(crate) fn budget(&self) -> &ReadBudget {
+        &self.budget
+    }
+
+    async fn reserve(&mut self, frame_len: usize) -> Result<()> {
+        if self.reserved.is_some() || frame_len <= READ_CHUNK {
+            return Ok(());
+        }
+        let too_large = MqttError::PacketTooLarge {
+            size: frame_len,
+            max: self.budget.limit,
+        };
+        if frame_len > self.budget.limit {
+            return Err(too_large);
+        }
+        let count = u32::try_from(frame_len).map_err(|_| too_large)?;
+        let permit = Arc::clone(&self.budget.permits)
+            .acquire_many_owned(count)
+            .await
+            .map_err(|_| MqttError::ClientClosed)?;
+        self.reserved = Some(permit);
+        Ok(())
+    }
+}
+
+pub(crate) trait ChunkReader {
+    fn read_chunk(&mut self, chunk: &mut [u8]) -> impl Future<Output = Result<usize>> + Send;
+}
+
 /// Reads one packet, keeping every byte received so far in `read_buffer`.
 ///
 /// The future is cancel-safe: all progress lives in `read_buffer`, the only
@@ -327,16 +399,38 @@ pub async fn read_packet_reusing_buffer<T: Transport>(
     }
 }
 
-/// Decodes the next complete packet in `read_buffer`, or `None` while it is incomplete.
-///
-/// # Errors
-/// Returns `PacketTooLarge` if the packet exceeds `max_packet_size`, or a decode
-/// error if the packet is malformed.
-pub fn decode_buffered_packet(
-    read_buffer: &mut BytesMut,
+pub(crate) async fn read_packet_within_budget<R: ChunkReader>(
+    reader: &mut R,
     protocol_version: u8,
+    read_buffer: &mut BytesMut,
     max_packet_size: usize,
-) -> Result<Option<Packet>> {
+    mut share: Option<&mut ReadShare>,
+) -> Result<(Packet, Option<ReadPermit>)> {
+    loop {
+        if let (Some(share), Some(frame_len)) = (
+            share.as_deref_mut(),
+            announced_frame_len(read_buffer, max_packet_size)?,
+        ) {
+            share.reserve(frame_len).await?;
+        }
+        if let Some(packet) =
+            decode_buffered_packet(read_buffer, protocol_version, max_packet_size)?
+        {
+            return Ok((packet, share.and_then(|share| share.reserved.take())));
+        }
+        let mut chunk = [0u8; READ_CHUNK];
+        let n = reader.read_chunk(&mut chunk).await?;
+        if n == 0 {
+            return Err(MqttError::ClientClosed);
+        }
+        read_buffer.extend_from_slice(&chunk[..n]);
+    }
+}
+
+fn buffered_frame(
+    read_buffer: &[u8],
+    max_packet_size: usize,
+) -> Result<Option<(usize, FixedHeader)>> {
     let Some(header_len) = fixed_header_len(read_buffer)? else {
         return Ok(None);
     };
@@ -349,8 +443,29 @@ pub fn decode_buffered_packet(
             max: max_packet_size,
         });
     }
+    Ok(Some((header_len, fixed_header)))
+}
+
+fn announced_frame_len(read_buffer: &[u8], max_packet_size: usize) -> Result<Option<usize>> {
+    Ok(buffered_frame(read_buffer, max_packet_size)?
+        .map(|(header_len, fixed_header)| header_len + fixed_header.remaining_length as usize))
+}
+
+/// Decodes the next complete packet in `read_buffer`, or `None` while it is incomplete.
+///
+/// # Errors
+/// Returns `PacketTooLarge` if the packet exceeds `max_packet_size`, or a decode
+/// error if the packet is malformed.
+pub fn decode_buffered_packet(
+    read_buffer: &mut BytesMut,
+    protocol_version: u8,
+    max_packet_size: usize,
+) -> Result<Option<Packet>> {
+    let Some((header_len, fixed_header)) = buffered_frame(read_buffer, max_packet_size)? else {
+        return Ok(None);
+    };
+    let frame_len = header_len + fixed_header.remaining_length as usize;
     if read_buffer.len() < frame_len {
-        read_buffer.reserve(frame_len - read_buffer.len());
         return Ok(None);
     }
     let mut frame = read_buffer.split_to(frame_len);
@@ -936,5 +1051,42 @@ mod tests {
 
         assert!(written[1] & crate::constants::masks::CONTINUATION_BIT != 0);
         assert!(written.len() > 200);
+    }
+
+    #[cfg(feature = "transport-quic")]
+    #[tokio::test]
+    async fn a_reservation_waits_until_earlier_ones_are_released() {
+        let budget = ReadBudget::new(3 * READ_CHUNK);
+        let mut first = budget.share();
+        let mut second = budget.share();
+        assert!(first.reserve(2 * READ_CHUNK).await.is_ok());
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            second.reserve(READ_CHUNK + 1),
+        )
+        .await;
+        assert!(waited.is_err());
+        assert!(budget.share().reserve(READ_CHUNK).await.is_ok());
+        drop(first.reserved.take());
+        assert!(second.reserve(READ_CHUNK + 1).await.is_ok());
+        assert!(matches!(
+            budget.share().reserve(3 * READ_CHUNK + 1).await,
+            Err(MqttError::PacketTooLarge { .. })
+        ));
+        budget.close();
+        assert!(matches!(
+            budget.share().reserve(READ_CHUNK + 1).await,
+            Err(MqttError::ClientClosed)
+        ));
+    }
+
+    #[test]
+    fn an_announced_size_does_not_allocate_before_its_bytes_arrive() {
+        let mut read_buffer = BytesMut::from(&[0x30, 0xFF, 0xFF, 0xFF, 0x7F][..]);
+        assert!(matches!(
+            decode_buffered_packet(&mut read_buffer, 5, usize::MAX),
+            Ok(None)
+        ));
+        assert!(read_buffer.capacity() < READ_CHUNK);
     }
 }
