@@ -1,14 +1,14 @@
 #![cfg(feature = "broker")]
 #![cfg(feature = "transport-quic")]
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use mqtt5::broker::config::{
     BrokerConfig, QuicConfig as BrokerQuicConfig, ServerDeliveryStrategy, StorageBackend,
     StorageConfig,
 };
 use mqtt5::broker::{BrokerShutdownHandle, MqttBroker};
 use mqtt5::error::Result;
-use mqtt5::transport::flow::{ControlFlowHeader, DataFlowHeader, FlowFlags, FlowId};
+use mqtt5::transport::flow::{decode_varint, ControlFlowHeader, DataFlowHeader, FlowFlags, FlowId};
 use mqtt5::transport::{QuicConfig, QuicSplitResult, QuicTransport};
 use mqtt5::Transport;
 use mqtt5_protocol::{QuicConnectionCode, QuicStreamCode};
@@ -460,9 +460,19 @@ async fn subscribe_on_flow(
     expire: u64,
     flags: FlowFlags,
 ) -> quinn::SendStream {
+    subscribe_on(split, 5, expire, flags, "flows/expiry").await
+}
+
+async fn subscribe_on(
+    split: &mut QuicSplitResult,
+    sequence: u64,
+    expire: u64,
+    flags: FlowFlags,
+    topic: &str,
+) -> quinn::SendStream {
     let mut flow = split.connection.open_uni().await.expect("open flow");
-    let mut bytes = data_flow(5, expire, flags);
-    bytes.extend_from_slice(&subscribe_frame("flows/expiry"));
+    let mut bytes = data_flow(sequence, expire, flags);
+    bytes.extend_from_slice(&subscribe_frame(topic));
     flow.write_all(&bytes).await.expect("subscribe on flow");
     let mut suback = [0u8; 6];
     split
@@ -474,15 +484,23 @@ async fn subscribe_on_flow(
     flow
 }
 
-async fn delivered_on_flow_subscription(split: &mut QuicSplitResult) -> bool {
+async fn published_to(
+    split: &mut QuicSplitResult,
+    topic: &str,
+) -> Option<(quinn::SendStream, quinn::RecvStream)> {
     split
         .send
-        .write_all(&publish_frame("flows/expiry", b"after"))
+        .write_all(&publish_frame(topic, b"to flow"))
         .await
         .expect("publish");
     tokio::time::timeout(Duration::from_secs(2), split.connection.accept_bi())
         .await
-        .is_ok()
+        .ok()
+        .and_then(std::result::Result::ok)
+}
+
+async fn delivered_on_flow_subscription(split: &mut QuicSplitResult) -> bool {
+    published_to(split, "flows/expiry").await.is_some()
 }
 
 async fn delivered_after_flow_end(
@@ -817,14 +835,15 @@ async fn clean_with_abort_if_no_state_discards_the_flow() {
 async fn recovered_after_reconnect(expire: u64, away: Duration) -> (StreamEnd, bool) {
     let (broker, addr) = Broker::start().await;
     let (mut first, _) = persistent_session_at(addr, true).await;
-    let _flow = subscribe_on_flow(&mut first, expire, CLEAN_START).await;
+    let flow = subscribe_on_flow(&mut first, expire, CLEAN_START).await;
     first.connection.close(quinn::VarInt::from_u32(0), b"gone");
     tokio::time::sleep(away).await;
     let (mut second, session_present) = persistent_session_at(addr, false).await;
     assert_eq!(session_present, 1);
-    let (_recovered, end) = reopen_flow(&second, RECOVER_IF_KEPT).await;
+    let (recovered, end) = reopen_flow(&second, RECOVER_IF_KEPT).await;
     let delivered = delivered_on_flow_subscription(&mut second).await;
     broker.stop().await;
+    drop((flow, recovered));
     (end, delivered)
 }
 
@@ -844,12 +863,49 @@ async fn a_flow_aborted_by_a_closed_connection_is_recovered_until_it_expires() {
 async fn a_taken_over_session_drops_subscriptions_of_flows_with_expire_zero() {
     let (broker, addr) = Broker::start().await;
     let (mut first, _) = persistent_session_at(addr, true).await;
-    let _flow = subscribe_on_flow(&mut first, 0, CLEAN_START).await;
+    let flow = subscribe_on_flow(&mut first, 0, CLEAN_START).await;
     let (mut second, session_present) = persistent_session_at(addr, false).await;
     assert_eq!(session_present, 1);
     let delivered = delivered_on_flow_subscription(&mut second).await;
     broker.stop().await;
+    drop(flow);
     assert!(!delivered);
+}
+
+async fn delivery_flow_id(split: &mut QuicSplitResult, topic: &str) -> FlowId {
+    let (_, mut recv) = published_to(split, topic)
+        .await
+        .expect("delivery stream opened");
+    let mut flow_type = [0u8; 1];
+    recv.read_exact(&mut flow_type)
+        .await
+        .expect("read delivery flow type");
+    assert_eq!(flow_type, [0x13]);
+    let mut id = [0u8; 8];
+    recv.read_exact(&mut id[..1])
+        .await
+        .expect("read delivery flow id");
+    let length = 1 << (id[0] >> 6);
+    recv.read_exact(&mut id[1..length])
+        .await
+        .expect("read delivery flow id");
+    FlowId::from(decode_varint(&mut Bytes::copy_from_slice(&id[..length])).expect("flow id"))
+}
+
+#[tokio::test]
+async fn subscriptions_on_client_flows_are_delivered_on_server_owned_flows() {
+    let (broker, mut split) = connected_session("server-flow-id").await;
+    let flows = [
+        subscribe_on(&mut split, 5, 300, CLEAN_START, "flows/a").await,
+        subscribe_on(&mut split, 6, 300, CLEAN_START, "flows/b").await,
+    ];
+    let first = delivery_flow_id(&mut split, "flows/a").await;
+    let second = delivery_flow_id(&mut split, "flows/b").await;
+    broker.stop().await;
+    drop(flows);
+    assert!(first.is_server_initiated());
+    assert!(second.is_server_initiated());
+    assert_ne!(first.raw(), second.raw());
 }
 
 const PACKET_LIMIT: usize = 1024;
