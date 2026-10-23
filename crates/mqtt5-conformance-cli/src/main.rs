@@ -25,12 +25,20 @@ use mqtt5_conformance::{
     registry::{ConformanceTest, CONFORMANCE_TESTS},
     sut::{SutDescriptor, SutHandle},
 };
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
 
 fn main() -> ExitCode {
+    if cfg!(panic = "abort") {
+        eprintln!(
+            "error: this binary was built with panic = \"abort\" and would stop at the first failing test; build it with `cargo build --profile conformance -p mqtt5-conformance-cli`"
+        );
+        return ExitCode::from(2);
+    }
+
     let (options, libtest_args) = CliOptions::from_env();
 
     let plan = match SutPlan::from_options(&options) {
@@ -50,11 +58,12 @@ fn main() -> ExitCode {
     };
 
     let capabilities = plan.capabilities_snapshot(&runtime);
-    let trials = build_trials(&capabilities, &plan, &runtime);
+    let outcomes: Outcomes = CONFORMANCE_TESTS.iter().map(|_| OnceLock::new()).collect();
+    let trials = build_trials(&capabilities, &plan, &runtime, &outcomes);
     let conclusion = libtest_mimic::run(&libtest_args, trials);
 
     if let Some(report_path) = options.report.as_deref() {
-        if let Err(error) = write_report(report_path, &capabilities, &conclusion) {
+        if let Err(error) = write_report(report_path, &capabilities, &conclusion, &outcomes) {
             eprintln!(
                 "warning: failed to write report {}: {error}",
                 report_path.display()
@@ -99,6 +108,8 @@ impl CliOptions {
     }
 }
 
+type Outcomes = Arc<[OnceLock<Result<(), String>>]>;
+
 enum SutPlan {
     External(Arc<SutDescriptor>),
     InProcess,
@@ -141,9 +152,10 @@ fn build_trials(
     capabilities: &Capabilities,
     plan: &Arc<SutPlan>,
     runtime: &Arc<Runtime>,
+    outcomes: &Outcomes,
 ) -> Vec<Trial> {
     let mut trials = Vec::with_capacity(CONFORMANCE_TESTS.len());
-    for test in CONFORMANCE_TESTS.iter().copied() {
+    for (index, test) in CONFORMANCE_TESTS.iter().copied().enumerate() {
         let name = trial_name(&test);
         let trial = if let Some(requirement) = first_unmet_requirement(capabilities, test.requires)
         {
@@ -152,7 +164,12 @@ fn build_trials(
         } else {
             let plan = Arc::clone(plan);
             let runtime = Arc::clone(runtime);
-            Trial::test(name, move || run_trial(&plan, &runtime, &test))
+            let outcomes = Arc::clone(outcomes);
+            Trial::test(name, move || {
+                let outcome = run_trial(&plan, &runtime, &test);
+                outcomes[index].get_or_init(|| outcome.clone());
+                outcome.map_err(Failed::from)
+            })
         };
         trials.push(trial);
     }
@@ -176,23 +193,17 @@ fn first_unmet_requirement(
         .find(|requirement| !requirement.matches(capabilities))
 }
 
-fn run_trial(plan: &SutPlan, runtime: &Runtime, test: &ConformanceTest) -> Result<(), Failed> {
-    let handle = plan.build_handle(runtime);
+fn run_trial(plan: &SutPlan, runtime: &Runtime, test: &ConformanceTest) -> Result<(), String> {
     let test = *test;
-    let future = (test.runner)(handle);
-    let outcome: Result<(), Box<dyn std::any::Any + Send>> = runtime.block_on(async {
-        let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
-        tokio::task::yield_now().await;
-        result
-    });
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(payload) => Err(Failed::from(format!(
-            "{}: {}",
-            test.name,
-            panic_message(payload.as_ref())
-        ))),
-    }
+    std::panic::catch_unwind(AssertUnwindSafe(|| plan.build_handle(runtime)))
+        .and_then(|handle| {
+            runtime.block_on(async {
+                let result = AssertUnwindSafe((test.runner)(handle)).catch_unwind().await;
+                tokio::task::yield_now().await;
+                result
+            })
+        })
+        .map_err(|payload| format!("{}: {}", test.name, panic_message(payload.as_ref())))
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -209,8 +220,9 @@ fn write_report(
     path: &Path,
     capabilities: &Capabilities,
     conclusion: &Conclusion,
+    outcomes: &Outcomes,
 ) -> std::io::Result<()> {
-    let tests_by_id = collect_test_results(capabilities);
+    let tests_by_id = collect_test_results(capabilities, outcomes);
     let report = serde_json::json!({
         "summary": {
             "passed": conclusion.num_passed,
@@ -233,15 +245,20 @@ fn write_report(
     std::fs::write(path, serialized)
 }
 
-fn collect_test_results(capabilities: &Capabilities) -> Vec<serde_json::Value> {
+fn collect_test_results(
+    capabilities: &Capabilities,
+    outcomes: &Outcomes,
+) -> Vec<serde_json::Value> {
     CONFORMANCE_TESTS
         .iter()
-        .map(|test| {
+        .zip(outcomes.iter())
+        .map(|(test, outcome)| {
             let unmet = first_unmet_requirement(capabilities, test.requires);
-            let status = if unmet.is_some() {
-                "skipped"
-            } else {
-                "planned"
+            let (status, failure) = match (unmet, outcome.get()) {
+                (Some(_), _) => ("skipped", None),
+                (None, Some(Ok(()))) => ("passed", None),
+                (None, Some(Err(message))) => ("failed", Some(message)),
+                (None, None) => ("not_run", None),
             };
             serde_json::json!({
                 "name": test.name,
@@ -250,6 +267,7 @@ fn collect_test_results(capabilities: &Capabilities) -> Vec<serde_json::Value> {
                 "line": test.line,
                 "ids": test.ids,
                 "status": status,
+                "failure": failure,
                 "unmet_requirement": unmet.map(Requirement::label),
             })
         })

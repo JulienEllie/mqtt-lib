@@ -14,6 +14,13 @@ use mqtt5_protocol::FixedHeader;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use ulid::Ulid;
+
+/// Generates a unique client ID with the given prefix using a ULID suffix.
+#[must_use]
+pub fn unique_client_id(prefix: &str) -> String {
+    format!("conf-{prefix}-{}", Ulid::new())
+}
 
 /// A raw transport-level client for sending arbitrary bytes to an MQTT broker.
 ///
@@ -808,7 +815,7 @@ impl RawPacketBuilder {
         body.put_u8(0x02);
         body.put_u16(60);
         body.put_u8(0);
-        put_mqtt_string(&mut body, "test-version-client");
+        put_mqtt_string(&mut body, &unique_client_id("test-version-client"));
 
         wrap_fixed_header(0x10, &body)
     }
@@ -826,7 +833,7 @@ impl RawPacketBuilder {
         body.put_u8(0x02);
         body.put_u16(60);
         body.put_u8(0);
-        put_mqtt_string(&mut body, "test-proto-client");
+        put_mqtt_string(&mut body, &unique_client_id("test-proto-client"));
 
         wrap_fixed_header(0x10, &body)
     }
@@ -844,7 +851,7 @@ impl RawPacketBuilder {
         body.put_u8(0x03);
         body.put_u16(60);
         body.put_u8(0);
-        put_mqtt_string(&mut body, "test-reserved-client");
+        put_mqtt_string(&mut body, &unique_client_id("test-reserved-client"));
 
         wrap_fixed_header(0x10, &body)
     }
@@ -864,7 +871,7 @@ impl RawPacketBuilder {
         body.put_u8(0x06);
         body.put_u16(60);
         body.put_u8(0);
-        put_mqtt_string(&mut body, "test-will-client");
+        put_mqtt_string(&mut body, &unique_client_id("test-will-client"));
 
         wrap_fixed_header(0x10, &body)
     }
@@ -915,7 +922,7 @@ impl RawPacketBuilder {
 
         encode_variable_int(&mut body, props.len());
         body.put(props);
-        put_mqtt_string(&mut body, "test-dup-prop-client");
+        put_mqtt_string(&mut body, &unique_client_id("test-dup-prop-client"));
 
         wrap_fixed_header(0x10, &body)
     }
@@ -934,7 +941,7 @@ impl RawPacketBuilder {
         body.put_u8(0x02);
         body.put_u16(60);
         body.put_u8(0);
-        put_mqtt_string(&mut body, "test-flags-client");
+        put_mqtt_string(&mut body, &unique_client_id("test-flags-client"));
 
         wrap_fixed_header(0x11, &body)
     }
@@ -1328,7 +1335,7 @@ impl RawPacketBuilder {
         body.put_u8(0x42);
         body.put_u16(60);
         body.put_u8(0);
-        put_mqtt_string(&mut body, "test-pw-client");
+        put_mqtt_string(&mut body, &unique_client_id("test-pw-client"));
         put_mqtt_string(&mut body, "secret");
 
         wrap_fixed_header(0x10, &body)

@@ -39,6 +39,48 @@
 
 ## Diary Entries
 
+### Citation drift pair removed after the MQTT-3.2.2-2 retag (2026-10-23)
+
+**Trigger**: `tests/manifest_load.rs` failed on the #264 branch. Retagging `connect_clean_start_session_present_zero` from MQTT-3.1.4-3 to MQTT-3.2.2-2 reconciled a pair listed in `known-citation-drift.txt`, and `manifest_and_test_attributes_agree_or_shrink` requires a reconciled pair to be removed. The earlier runs on this branch used `--lib` only, which skips that test, and so does the CI job.
+
+**Fix**: removed `connect_clean_start_session_present_zero MQTT-3.1.4-3` from `known-citation-drift.txt` (23 pairs left).
+
+**Results**: `cargo test -p mqtt5-conformance --features inprocess-fixture` passes: lib 245, manifest_load 11, and the integration test files.
+
+### Review fixes for the #219 to #224 branch (2026-10-22)
+
+**Trigger**: code review of PR #264.
+
+**Fixed**:
+- The CLI built the SUT handle outside `catch_unwind`, so a panic while starting the in-process broker failed the trial but left its outcome empty, and the report said `not_run`. `run_trial` now catches that panic too. Control: with a temporary panic in `build_handle`, the report lists the test as `failed` with the panic message.
+- A binary built with `panic = "abort"` now exits with code 2 and tells you to use `--profile conformance`. Checked with `cargo build --release -p mqtt5-conformance-cli`: `--list` exits 2 with the message.
+- `overlapping_copies` waited only 1 s for a second copy, so a broker sending the second copy late was judged as sending one copy and failed MQTT-3.3.4-4. It now waits the full 10 s timeout for each copy and returns `[Option<ParsedPublish>; 2]`. Any packet that is not a well-formed PUBLISH fails the test instead of being skipped.
+- The overlap tests and the takeover test now assert the SUBACK and its granted QoS instead of discarding it, so the takeover test knows the session it takes over holds a subscription.
+- `disconnect_session_expiry_after_zero_is_protocol_error` accepted any packet before the close. It now fails unless the only packet is a DISCONNECT, and checks its reason code is 0x82.
+- The raw CONNECT builders call `unique_client_id`, which moved from `harness` to `raw_client` (re-exported from `harness`), because `raw_client` is built without the `inprocess-fixture` feature.
+- `harness.rs` dropped its `#![allow(clippy::missing_panics_doc)]` and documents `# Panics` on the 12 functions that needed it.
+- BROKER_SETUP.md capability counts are exact now (counted from the `requires` lists), with a row for assigned client IDs.
+
+**Not exercised here**: the malformed PUBLISH and non-DISCONNECT failure paths. The in-process broker sends neither.
+
+**Results**: CLI against the in-process broker 198 passed, 3 skipped; conformance lib tests 245 passed; fmt and the four pedantic clippy runs clean.
+
+### Report outcomes, parser regression test, ClientIDs, optional behaviour, coverage gaps (2026-10-22)
+
+**Trigger**: issues #219 to #224, found running the suite against an external broker.
+
+**#219 report status**: the CLI wrote `"planned"` for every test that met its requirements, whether it ran, passed, failed or was filtered out. Reproduced with one test run and 199 filtered out: 197 `planned`, 3 `skipped`. Each trial now records its outcome, and the report gives `passed`, `failed` (with the panic message in `failure`), `skipped` or `not_run`. The full in-process run gives 198 `passed` and 3 `skipped`, and a test run against a closed port is `failed` with its message.
+
+**#220 CONNACK properties**: already fixed by #250, which taught `ParsedProperties` to skip every v5 property it does not extract. A unit test with the issue's two CONNACKs (Receive Maximum, Topic Alias Maximum) fails on the commit before #250 and passes now.
+
+**#221 shared ClientIDs**: the raw CONNECT builders used fixed ClientIDs (`test-flags-client`, `test-version-client`, `test-proto-client`, `test-reserved-client`, `test-will-client`, `test-dup-prop-client`, `test-pw-client`, `malformed-uflag`). Tests running in parallel could take over each other's session, and the takeover close counted as the broker rejecting a malformed packet. Every builder now generates a ULID-suffixed ClientID.
+
+**#222 optional behaviour**: checked against the normative text. MQTT-3.1.3-6 makes accepting an empty ClientID a MAY, so `connect_empty_client_id_server_assigns` and `connack_assigned_client_id_unique` now require the new `assigned_client_id_supported` requirement; with it set to false both are listed as skipped. §3.3.4 makes further copies for overlapping subscriptions a MAY, so the two overlap tests accept one or two copies: the maximum QoS across what arrives must be 1 (MQTT-3.3.4-2), a single copy must carry both identifiers (MQTT-3.3.4-4, now Tested instead of NotApplicable) and two copies must carry one each (MQTT-3.3.4-5). The single-copy branch is not exercised by the in-process broker, which sends two copies. §4.13.1 says the Server MUST close the connection and SHOULD send DISCONNECT, so `disconnect_session_expiry_after_zero_is_protocol_error` accepts a bare close and still checks 0x82 when a DISCONNECT arrives.
+
+**#223 coverage gaps**: `connect_clean_start_takeover_session_present_zero` connects with Clean Start 1 to a ClientID whose session is live with a subscription and checks Session Present 0 (MQTT-3.2.2-2). `publish_retain_handling_zero_sends_retained` now checks the RETAIN flag is 1 on the retained delivery (§3.3.1.3). Negative control: a broker changed to report Session Present whenever a stored session exists, and to send retained messages with RETAIN 0, passes `connect_clean_start_session_present_zero` and fails both new assertions. `connect_clean_start_session_present_zero` was tagged MQTT-3.1.4-3, a takeover statement, while the manifest lists it under MQTT-3.2.2-2; the tag now matches.
+
+**#224 CLI build**: a release build has `panic = "abort"`, so the first failing test ends the run. Reproduced against a closed port: the release binary stopped at the first of 21 tests with no summary, the `conformance` profile build reported 21 failed. The READMEs and BROKER_SETUP.md now build with `--profile conformance` and run `target/conformance/mqtt5-conformance`, and no longer state a test count.
+
 ### QUIC buffer budget reservations (2026-10-22)
 
 **Trigger**: second review of PR #263.
