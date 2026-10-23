@@ -6,6 +6,7 @@
 //! [`RawPacketBuilder`] constructs both valid and deliberately invalid MQTT
 //! v5.0 packets for conformance edge-case testing.
 
+use crate::packet_parser::decode_variable_int;
 use crate::transport::{TcpTransport, Transport};
 use bytes::{BufMut, BytesMut};
 use mqtt5_protocol::packet::connack::ConnAckPacket;
@@ -15,6 +16,24 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
+
+fn parse_ack_reason_codes(data: &[u8], packet_type: u8) -> Option<(u16, Vec<u8>)> {
+    if data.first() != Some(&packet_type) {
+        return None;
+    }
+    let (remaining_len, body_start) = decode_variable_int(data, 1)?;
+    let end = body_start + remaining_len as usize;
+    if remaining_len < 3 || data.len() < end {
+        return None;
+    }
+    let packet_id = u16::from_be_bytes([data[body_start], data[body_start + 1]]);
+    let (props_len, props_start) = decode_variable_int(data, body_start + 2)?;
+    let codes_start = props_start + props_len as usize;
+    if codes_start > end {
+        return None;
+    }
+    Some((packet_id, data[codes_start..end].to_vec()))
+}
 
 /// Generates a unique client ID with the given prefix using a ULID suffix.
 #[must_use]
@@ -257,126 +276,22 @@ impl<T: Transport> RawMqttClient<T> {
         Some(u16::from_be_bytes([data[idx], data[idx + 1]]))
     }
 
-    /// Reads and parses a SUBACK packet, returning `(packet_id, reason_codes)`.
+    /// Reads one packet and parses it as a SUBACK, returning
+    /// `(packet_id, reason_codes)`.
     ///
-    /// SUBACK fixed header byte is `0x90`. Parses: remaining length, packet ID
-    /// (2 bytes), properties length (variable int, skipped), then collects all
-    /// remaining bytes as reason codes.
-    /// Returns `None` if the response is not a valid SUBACK or the timeout elapses.
+    /// Returns `None` if the packet is not a valid SUBACK or the timeout elapses.
     pub async fn expect_suback(&mut self, timeout_dur: Duration) -> Option<(u16, Vec<u8>)> {
-        let data = self.read_packet_bytes(timeout_dur).await?;
-        if data.len() < 4 || data[0] != 0x90 {
-            return None;
-        }
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
-        let payload_start = idx;
-        if data.len() < payload_start + remaining_len as usize || remaining_len < 3 {
-            return None;
-        }
-        let packet_id = u16::from_be_bytes([data[idx], data[idx + 1]]);
-        idx += 2;
-        let mut props_len: u32 = 0;
-        let mut props_shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            props_len |= u32::from(byte & 0x7F) << props_shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            props_shift += 7;
-            if props_shift > 21 {
-                return None;
-            }
-        }
-        idx += props_len as usize;
-        let end = payload_start + remaining_len as usize;
-        if idx > end {
-            return None;
-        }
-        let reason_codes = data[idx..end].to_vec();
-        Some((packet_id, reason_codes))
+        let data = self.read_mqtt_packet(timeout_dur).await?;
+        parse_ack_reason_codes(&data, 0x90)
     }
 
-    /// Reads and parses an UNSUBACK packet, returning `(packet_id, reason_codes)`.
+    /// Reads one packet and parses it as an UNSUBACK, returning
+    /// `(packet_id, reason_codes)`.
     ///
-    /// UNSUBACK fixed header byte is `0xB0`. Same structure as SUBACK:
-    /// remaining length, packet ID (2 bytes), properties length (variable int,
-    /// skipped), then all remaining bytes are reason codes.
-    /// Returns `None` if the response is not a valid UNSUBACK or the timeout elapses.
+    /// Returns `None` if the packet is not a valid UNSUBACK or the timeout elapses.
     pub async fn expect_unsuback(&mut self, timeout_dur: Duration) -> Option<(u16, Vec<u8>)> {
-        let data = self.read_packet_bytes(timeout_dur).await?;
-        if data.len() < 4 || data[0] != 0xB0 {
-            return None;
-        }
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
-        let payload_start = idx;
-        if data.len() < payload_start + remaining_len as usize || remaining_len < 3 {
-            return None;
-        }
-        let packet_id = u16::from_be_bytes([data[idx], data[idx + 1]]);
-        idx += 2;
-        let mut props_len: u32 = 0;
-        let mut props_shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            props_len |= u32::from(byte & 0x7F) << props_shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            props_shift += 7;
-            if props_shift > 21 {
-                return None;
-            }
-        }
-        idx += props_len as usize;
-        let end = payload_start + remaining_len as usize;
-        if idx > end {
-            return None;
-        }
-        let reason_codes = data[idx..end].to_vec();
-        Some((packet_id, reason_codes))
+        let data = self.read_mqtt_packet(timeout_dur).await?;
+        parse_ack_reason_codes(&data, 0xB0)
     }
 
     /// Reads and parses a PUBLISH packet from the server, returning
@@ -769,13 +684,6 @@ impl<T: Transport> RawMqttClient<T> {
             }
         }
     }
-
-    /// # Errors
-    ///
-    /// Returns the I/O error if the write half cannot be shut down.
-    pub async fn shutdown_write(&mut self) -> std::io::Result<()> {
-        self.stream.shutdown().await
-    }
 }
 
 /// Builds hand-crafted MQTT v5.0 packet byte sequences.
@@ -890,14 +798,19 @@ impl RawPacketBuilder {
         wrap_fixed_header(0x30, &body)
     }
 
-    /// Builds a truncated CONNECT packet: fixed header claims 50 bytes
-    /// remaining but only 3 bytes of body follow.
-    ///
-    /// Used to test `[MQTT-3.1.4-1]`: server MUST close the connection
-    /// on malformed packets.
+    /// Builds a complete CONNECT packet whose properties length (10) runs
+    /// past the end of the packet, which holds only a 3-byte payload.
     #[must_use]
-    pub fn connect_malformed_truncated() -> Vec<u8> {
-        vec![0x10, 50, 0x00, 0x04, 0x4D]
+    pub fn connect_with_overlong_properties() -> Vec<u8> {
+        let mut body = BytesMut::new();
+        body.put_u16(4);
+        body.put_slice(b"MQTT");
+        body.put_u8(5);
+        body.put_u8(0x02);
+        body.put_u16(60);
+        body.put_u8(10);
+        put_mqtt_string(&mut body, "a");
+        wrap_fixed_header(0x10, &body)
     }
 
     /// Builds a CONNECT packet with a duplicated Session Expiry Interval

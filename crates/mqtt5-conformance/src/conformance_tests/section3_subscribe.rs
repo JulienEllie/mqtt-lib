@@ -33,9 +33,10 @@ async fn subscribe_invalid_flags_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.8.3-2]` SUBSCRIBE payload MUST contain at least one topic filter.
+/// `[MQTT-3.8.3-2]` `[MQTT-4.13.1-1]` SUBSCRIBE payload MUST contain at least
+/// one topic filter.
 #[conformance_test(
-    ids = ["MQTT-3.8.3-2"],
+    ids = ["MQTT-3.8.3-2", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn subscribe_empty_payload_rejected(sut: SutHandle) {
@@ -55,9 +56,10 @@ async fn subscribe_empty_payload_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.8.3-4]` `NoLocal=1` on a shared subscription is a Protocol Error.
+/// `[MQTT-3.8.3-4]` `[MQTT-4.13.1-1]` `NoLocal=1` on a shared subscription is a
+/// Protocol Error.
 #[conformance_test(
-    ids = ["MQTT-3.8.3-4"],
+    ids = ["MQTT-3.8.3-4", "MQTT-4.13.1-1"],
     requires = ["transport.tcp", "shared_subscription_available"],
 )]
 async fn subscribe_no_local_shared_rejected(sut: SutHandle) {
@@ -79,9 +81,10 @@ async fn subscribe_no_local_shared_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.8.4-2]` SUBACK packet ID must match SUBSCRIBE packet ID.
+/// `[MQTT-2.2.1-6]` `[MQTT-3.8.4-1]` `[MQTT-3.8.4-2]` The Server MUST answer a
+/// SUBSCRIBE with a SUBACK carrying the same Packet Identifier.
 #[conformance_test(
-    ids = ["MQTT-3.8.4-2"],
+    ids = ["MQTT-2.2.1-6", "MQTT-3.8.4-1", "MQTT-3.8.4-2"],
     requires = ["transport.tcp"],
 )]
 async fn suback_packet_id_matches(sut: SutHandle) {
@@ -112,9 +115,10 @@ async fn suback_packet_id_matches(sut: SutHandle) {
     assert_eq!(reason_codes.len(), 1, "SUBACK must contain one reason code");
 }
 
-/// `[MQTT-3.8.4-6]` SUBACK must contain one reason code per topic filter.
+/// `[MQTT-3.8.4-5]` `[MQTT-3.8.4-6]` A SUBSCRIBE with several Topic Filters
+/// must be answered with one SUBACK holding a Reason Code for each filter.
 #[conformance_test(
-    ids = ["MQTT-3.8.4-6"],
+    ids = ["MQTT-3.8.4-5", "MQTT-3.8.4-6"],
     requires = ["transport.tcp"],
 )]
 async fn suback_reason_codes_per_filter(sut: SutHandle) {
@@ -142,10 +146,10 @@ async fn suback_reason_codes_per_filter(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.8.4-7]` SUBACK grants the exact `QoS` requested on a default
-/// broker (max `QoS` 2).
+/// `[MQTT-3.8.4-1]` `[MQTT-3.8.4-7]` On a broker with maximum `QoS` 2, the
+/// SUBACK Reason Code for each filter must be the `QoS` that was requested.
 #[conformance_test(
-    ids = ["MQTT-3.8.4-7"],
+    ids = ["MQTT-3.8.4-1", "MQTT-3.8.4-7"],
     requires = ["transport.tcp", "max_qos>=2"],
 )]
 async fn suback_grants_requested_qos(sut: SutHandle) {
@@ -229,9 +233,10 @@ async fn subscribe_replaces_existing(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.8.3-5]` Reserved bits in the subscribe options byte MUST be zero.
+/// `[MQTT-3.8.3-5]` `[MQTT-4.13.1-1]` Reserved bits in the subscribe options
+/// byte MUST be zero.
 #[conformance_test(
-    ids = ["MQTT-3.8.3-5"],
+    ids = ["MQTT-3.8.3-5", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn subscribe_reserved_option_bits_rejected(sut: SutHandle) {
@@ -255,9 +260,10 @@ async fn subscribe_reserved_option_bits_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.8.3-1]` Topic filter in SUBSCRIBE must be valid UTF-8.
+/// `[MQTT-3.8.3-1]` `[MQTT-4.13.1-1]` Topic filter in SUBSCRIBE must be valid
+/// UTF-8.
 #[conformance_test(
-    ids = ["MQTT-3.8.3-1"],
+    ids = ["MQTT-3.8.3-1", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn subscribe_invalid_utf8_rejected(sut: SutHandle) {
@@ -277,10 +283,11 @@ async fn subscribe_invalid_utf8_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.8.4-4]` When Retain Handling is 0 (`SendAtSubscribe`), retained
-/// messages are sent on every subscribe, including re-subscribes.
+/// `[MQTT-3.3.1-9]` `[MQTT-3.8.4-4]` With Retain Handling 0, the Server MUST
+/// send matching retained messages on every SUBSCRIBE, including a
+/// re-subscribe.
 #[conformance_test(
-    ids = ["MQTT-3.8.4-4"],
+    ids = ["MQTT-3.3.1-9", "MQTT-3.8.4-4"],
     requires = ["transport.tcp", "retain_available"],
 )]
 async fn retain_handling_zero_sends_on_resubscribe(sut: SutHandle) {
@@ -331,11 +338,11 @@ async fn retain_handling_zero_sends_on_resubscribe(sut: SutHandle) {
     assert_eq!(msgs2[0].payload, b"retained-payload");
 }
 
-/// `[MQTT-3.3.4-3]` A retained message delivered as the result of a new
-/// subscription that carries a Subscription Identifier must be sent with that
-/// Subscription Identifier, exactly as for live publications.
+/// `[MQTT-3.3.4-4]` A retained message sent for a new subscription that has a
+/// Subscription Identifier must carry that Subscription Identifier, as for live
+/// publications.
 #[conformance_test(
-    ids = ["MQTT-3.3.4-3"],
+    ids = ["MQTT-3.3.4-4"],
     requires = ["transport.tcp", "retain_available", "subscription_identifier_available"],
 )]
 async fn retained_message_carries_subscription_identifier(sut: SutHandle) {
@@ -375,7 +382,7 @@ async fn retained_message_carries_subscription_identifier(sut: SutHandle) {
     assert_eq!(
         msgs[0].subscription_identifiers,
         vec![42],
-        "[MQTT-3.3.4-3] retained message delivered at subscribe time must carry the subscription's Subscription Identifier"
+        "[MQTT-3.3.4-4] retained message delivered at subscribe time must carry the subscription's Subscription Identifier"
     );
 }
 

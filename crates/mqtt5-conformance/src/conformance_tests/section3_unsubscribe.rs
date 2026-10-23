@@ -1,11 +1,11 @@
 //! Sections 3.10–3.11 — UNSUBSCRIBE and UNSUBACK.
 
+use crate::assertions;
 use crate::conformance_test;
 use crate::harness::unique_client_id;
 use crate::raw_client::{RawMqttClient, RawPacketBuilder};
 use crate::sut::SutHandle;
 use crate::test_client::TestClient;
-use mqtt5_protocol::types::{QoS, SubscribeOptions};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,10 +36,10 @@ async fn unsubscribe_invalid_flags_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.10.3-2]` UNSUBSCRIBE payload MUST contain at least one topic
-/// filter.
+/// `[MQTT-3.10.3-2]` `[MQTT-4.13.1-1]` UNSUBSCRIBE payload MUST contain at
+/// least one topic filter.
 #[conformance_test(
-    ids = ["MQTT-3.10.3-2"],
+    ids = ["MQTT-3.10.3-2", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn unsubscribe_empty_payload_rejected(sut: SutHandle) {
@@ -59,9 +59,10 @@ async fn unsubscribe_empty_payload_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.10.4-5]` UNSUBACK packet ID must match UNSUBSCRIBE packet ID.
+/// `[MQTT-2.2.1-6]` `[MQTT-3.10.4-4]` `[MQTT-3.10.4-5]` The Server MUST answer
+/// an UNSUBSCRIBE with an UNSUBACK carrying the same Packet Identifier.
 #[conformance_test(
-    ids = ["MQTT-3.10.4-5"],
+    ids = ["MQTT-2.2.1-6", "MQTT-3.10.4-4", "MQTT-3.10.4-5"],
     requires = ["transport.tcp"],
 )]
 async fn unsuback_packet_id_matches(sut: SutHandle) {
@@ -104,9 +105,11 @@ async fn unsuback_packet_id_matches(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.11.3-1]` UNSUBACK must contain one reason code per topic filter.
+/// `[MQTT-3.10.4-6]` `[MQTT-3.11.3-2]` An UNSUBSCRIBE with several Topic
+/// Filters must be answered with one UNSUBACK holding an UNSUBSCRIBE Reason
+/// Code for each filter.
 #[conformance_test(
-    ids = ["MQTT-3.11.3-1"],
+    ids = ["MQTT-3.10.4-6", "MQTT-3.11.3-2"],
     requires = ["transport.tcp"],
 )]
 async fn unsuback_reason_codes_per_filter(sut: SutHandle) {
@@ -130,7 +133,7 @@ async fn unsuback_reason_codes_per_filter(sut: SutHandle) {
     assert_eq!(
         reason_codes.len(),
         3,
-        "[MQTT-3.11.3-1] UNSUBACK must contain one reason code per topic filter"
+        "[MQTT-3.11.3-2] UNSUBACK must contain one reason code per topic filter"
     );
 }
 
@@ -172,10 +175,11 @@ async fn unsuback_success_for_existing(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.11.3-2]` Unsubscribe from a topic never subscribed — reason code
-/// should be `NoSubscriptionExisted` (0x11).
+/// `[MQTT-3.10.4-5]` `[MQTT-3.11.3-2]` An UNSUBSCRIBE for a filter that was
+/// never subscribed must still get an UNSUBACK, with Reason Code 0x11 (No
+/// subscription existed).
 #[conformance_test(
-    ids = ["MQTT-3.11.3-2"],
+    ids = ["MQTT-3.10.4-5", "MQTT-3.11.3-2"],
     requires = ["transport.tcp"],
 )]
 async fn unsuback_no_subscription_existed(sut: SutHandle) {
@@ -201,59 +205,73 @@ async fn unsuback_no_subscription_existed(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.10.4-1]` After unsubscribing, the broker must stop sending
-/// messages for that topic filter.
+/// `[MQTT-3.10.4-1]` `[MQTT-3.10.4-2]` After an UNSUBSCRIBE that matches a
+/// subscription exactly, the Server MUST delete it and stop sending messages
+/// for it.
 #[conformance_test(
     ids = ["MQTT-3.10.4-1", "MQTT-3.10.4-2"],
     requires = ["transport.tcp"],
 )]
 async fn unsubscribe_stops_delivery(sut: SutHandle) {
-    let subscriber = TestClient::connect_with_prefix(&sut, "unsub-stop")
-        .await
-        .unwrap();
-    let opts = SubscribeOptions {
-        qos: QoS::AtMostOnce,
-        ..Default::default()
-    };
-    let subscription = subscriber.subscribe("test/unsub-stop", opts).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let topic = format!("unsub-stop/{}", unique_client_id("t"));
+    let mut subscriber =
+        assertions::subscribed_raw_client(&sut, "unsub-stop", &topic, TIMEOUT).await;
+    let mut witness =
+        assertions::subscribed_raw_client(&sut, "unsub-stop-witness", &topic, TIMEOUT).await;
 
     let publisher = TestClient::connect_with_prefix(&sut, "unsub-stop-pub")
         .await
         .unwrap();
-    publisher
-        .publish("test/unsub-stop", b"before")
-        .await
-        .unwrap();
-
+    publisher.publish(&topic, b"before").await.unwrap();
     assert!(
-        subscription.wait_for_messages(1, TIMEOUT).await,
-        "subscriber should receive message before unsubscribe"
+        assertions::first_publish_matching(&mut subscriber, TIMEOUT, |_| true)
+            .await
+            .is_some(),
+        "the subscriber must receive the message before unsubscribing"
+    );
+    assert!(
+        assertions::first_publish_matching(&mut witness, TIMEOUT, |_| true)
+            .await
+            .is_some(),
+        "the witness must receive the message before the unsubscribe"
     );
 
-    subscriber.unsubscribe("test/unsub-stop").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    publisher
-        .publish("test/unsub-stop", b"after")
+    subscriber
+        .send_raw(&RawPacketBuilder::unsubscribe(&topic, 2))
         .await
         .unwrap();
-
-    let got_more = subscription
-        .wait_for_messages(2, Duration::from_millis(500))
-        .await;
-    assert!(
-        !got_more,
-        "[MQTT-3.10.4-1] subscriber must not receive messages after unsubscribe"
+    let (_, reason_codes) = subscriber
+        .expect_unsuback(TIMEOUT)
+        .await
+        .expect("expected UNSUBACK");
+    assert_eq!(
+        reason_codes,
+        [0x00],
+        "[MQTT-3.10.4-1] the exactly matching subscription must be deleted"
     );
+
+    publisher.publish(&topic, b"after").await.unwrap();
+    assert!(
+        assertions::first_publish_matching(&mut witness, TIMEOUT, |_| true)
+            .await
+            .is_some(),
+        "the witness must receive the message published after the unsubscribe"
+    );
+    assertions::expect_no_publish(
+        &mut subscriber,
+        "MQTT-3.10.4-2",
+        Duration::from_millis(300),
+        |_| true,
+    )
+    .await;
 }
 
-/// `[MQTT-3.10.4-1]` `[MQTT-3.11.3-2]` Multi-filter UNSUBSCRIBE: one
-/// existing, one non-existing. Verify reason codes (Success +
-/// `NoSubscriptionExisted`) and that messages stop for unsubscribed topic
-/// but continue for remaining.
+/// `[MQTT-3.10.4-1]` `[MQTT-3.10.4-2]` `[MQTT-3.10.4-6]` `[MQTT-3.11.3-1]`
+/// `[MQTT-3.11.3-2]` An UNSUBSCRIBE with one existing and one non-existing
+/// filter must get one UNSUBACK with 0x00 and 0x11 in filter order, and
+/// messages must stop for the removed filter only.
 #[conformance_test(
-    ids = ["MQTT-3.10.4-1", "MQTT-3.11.3-2"],
+    ids = ["MQTT-3.10.4-1", "MQTT-3.10.4-2", "MQTT-3.10.4-6", "MQTT-3.11.3-1", "MQTT-3.11.3-2"],
     requires = ["transport.tcp"],
 )]
 async fn unsubscribe_partial_multi(sut: SutHandle) {
@@ -313,10 +331,10 @@ async fn unsubscribe_partial_multi(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.11.3-2]` Unsubscribe twice from the same topic. First
-/// UNSUBACK=Success, second UNSUBACK=`NoSubscriptionExisted`.
+/// `[MQTT-3.10.4-1]` `[MQTT-3.11.3-2]` Unsubscribing twice from the same filter
+/// must get 0x00 the first time and 0x11 (No subscription existed) the second.
 #[conformance_test(
-    ids = ["MQTT-3.11.3-2"],
+    ids = ["MQTT-3.10.4-1", "MQTT-3.11.3-2"],
     requires = ["transport.tcp"],
 )]
 async fn unsubscribe_idempotent(sut: SutHandle) {
@@ -362,11 +380,11 @@ async fn unsubscribe_idempotent(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-3.11.3-2]` UNSUBACK reason codes must be spec-defined values.
-/// Success (0x00) and `NoSubscriptionExisted` (0x11) are the two valid
-/// outcomes for a well-formed UNSUBSCRIBE. Verify both are in range.
+/// `[MQTT-3.11.3-1]` `[MQTT-3.11.3-2]` The UNSUBACK Reason Codes for a
+/// well-formed UNSUBSCRIBE must be UNSUBSCRIBE Reason Code values, in the order
+/// of the Topic Filters.
 #[conformance_test(
-    ids = ["MQTT-3.11.3-2"],
+    ids = ["MQTT-3.11.3-1", "MQTT-3.11.3-2"],
     requires = ["transport.tcp"],
 )]
 async fn unsuback_reason_codes_are_valid_spec_values(sut: SutHandle) {
@@ -406,18 +424,18 @@ async fn unsuback_reason_codes_are_valid_spec_values(sut: SutHandle) {
     }
     assert_eq!(
         reason_codes[0], 0x00,
-        "first filter (subscribed) should be Success (0x00)"
+        "[MQTT-3.11.3-1] first filter (subscribed) should be Success (0x00)"
     );
     assert_eq!(
         reason_codes[1], 0x11,
-        "second filter (never existed) should be NoSubscriptionExisted (0x11)"
+        "[MQTT-3.11.3-1] second filter (never existed) should be NoSubscriptionExisted (0x11)"
     );
 }
 
-/// `[MQTT-3.10.3-1]` Topic filter in UNSUBSCRIBE must be valid UTF-8.
-/// Sending invalid UTF-8 bytes must cause disconnect.
+/// `[MQTT-3.10.3-1]` `[MQTT-4.13.1-1]` Topic filter in UNSUBSCRIBE must be
+/// valid UTF-8. Sending invalid UTF-8 bytes must cause disconnect.
 #[conformance_test(
-    ids = ["MQTT-3.10.3-1"],
+    ids = ["MQTT-3.10.3-1", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn unsubscribe_invalid_utf8_rejected(sut: SutHandle) {

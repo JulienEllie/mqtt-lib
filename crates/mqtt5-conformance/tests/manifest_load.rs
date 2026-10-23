@@ -83,6 +83,26 @@ fn every_cited_test_is_registered() {
 }
 
 #[test]
+fn every_cited_test_declares_the_statement() {
+    let manifest = ConformanceManifest::load("conformance.toml");
+    let mut undeclared = Vec::new();
+    for statement in manifest.sections.values().flat_map(|s| &s.statements) {
+        for name in &statement.test_names {
+            let declares = CONFORMANCE_TESTS
+                .iter()
+                .any(|t| t.name == name.as_str() && t.ids.contains(&statement.id.as_str()));
+            if !declares {
+                undeclared.push(format!("{} -> {name}", statement.id));
+            }
+        }
+    }
+    assert!(
+        undeclared.is_empty(),
+        "manifest cites tests whose ids do not include the statement: {undeclared:?}"
+    );
+}
+
+#[test]
 fn every_registered_test_targets_a_known_statement() {
     let manifest = ConformanceManifest::load("conformance.toml");
     let known = manifest_statement_ids(&manifest);
@@ -179,19 +199,10 @@ fn statement_text_drift_only_shrinks() {
     );
 }
 
-fn known_citation_drift() -> BTreeSet<String> {
-    include_str!("../known-citation-drift.txt")
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with(|c: char| c.is_ascii_lowercase()) && l.contains(" MQTT-"))
-        .map(ToString::to_string)
-        .collect()
-}
-
 #[test]
-fn manifest_and_test_attributes_agree_or_shrink() {
+fn every_declared_statement_cites_the_test() {
     let manifest = ConformanceManifest::load("conformance.toml");
-    let mut disagreements = BTreeSet::new();
+    let mut uncited = Vec::new();
     for test in CONFORMANCE_TESTS {
         for id in test.ids {
             let cited = manifest
@@ -201,21 +212,13 @@ fn manifest_and_test_attributes_agree_or_shrink() {
                 .find(|st| st.id == *id)
                 .is_some_and(|st| st.test_names.iter().any(|n| n == test.name));
             if !cited {
-                disagreements.insert(format!("{} {id}", test.name));
+                uncited.push(format!("{} {id}", test.name));
             }
         }
     }
-    let known = known_citation_drift();
-    let fresh: Vec<_> = disagreements.difference(&known).cloned().collect();
     assert!(
-        fresh.is_empty(),
-        "a registered test declares a statement that does not cite it back, and the pair is not \
-         recorded in known-citation-drift.txt: {fresh:?}"
-    );
-    let repaired: Vec<_> = known.difference(&disagreements).cloned().collect();
-    assert!(
-        repaired.is_empty(),
-        "these pairs are now reconciled and must be removed from known-citation-drift.txt: {repaired:?}"
+        uncited.is_empty(),
+        "registered tests declare statements whose test_names do not cite them: {uncited:?}"
     );
 }
 

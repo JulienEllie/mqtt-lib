@@ -13,9 +13,10 @@ use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `[MQTT-3.3.1-4]` A PUBLISH packet MUST NOT have both `QoS` bits set to 1.
+/// `[MQTT-3.3.1-4]` `[MQTT-4.13.1-1]` A PUBLISH packet MUST NOT have both `QoS`
+/// bits set to 1.
 #[conformance_test(
-    ids = ["MQTT-3.3.1-4"],
+    ids = ["MQTT-3.3.1-4", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn publish_qos3_is_malformed(sut: SutHandle) {
@@ -35,9 +36,10 @@ async fn publish_qos3_is_malformed(sut: SutHandle) {
     assertions::expect_disconnect(&mut raw, "MQTT-3.3.1-4", TIMEOUT).await;
 }
 
-/// `[MQTT-3.3.1-2]` The DUP flag MUST be set to 0 for all `QoS` 0 messages.
+/// `[MQTT-3.3.1-2]` `[MQTT-4.13.1-1]` The DUP flag MUST be set to 0 for all
+/// `QoS` 0 messages.
 #[conformance_test(
-    ids = ["MQTT-3.3.1-2"],
+    ids = ["MQTT-3.3.1-2", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn publish_dup_must_be_zero_for_qos0(sut: SutHandle) {
@@ -54,10 +56,10 @@ async fn publish_dup_must_be_zero_for_qos0(sut: SutHandle) {
     assertions::expect_disconnect(&mut raw, "MQTT-3.3.1-2", TIMEOUT).await;
 }
 
-/// `[MQTT-3.3.2-2]` The Topic Name in the PUBLISH packet MUST NOT contain
-/// wildcard characters.
+/// `[MQTT-3.3.2-2]` `[MQTT-4.7.0-1]` `[MQTT-4.13.1-1]` The Topic Name in a
+/// PUBLISH MUST NOT contain wildcard characters.
 #[conformance_test(
-    ids = ["MQTT-3.3.2-2"],
+    ids = ["MQTT-3.3.2-2", "MQTT-4.7.0-1", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn publish_topic_must_not_contain_wildcards(sut: SutHandle) {
@@ -74,10 +76,11 @@ async fn publish_topic_must_not_contain_wildcards(sut: SutHandle) {
     assertions::expect_disconnect(&mut raw, "MQTT-3.3.2-2", TIMEOUT).await;
 }
 
-/// `[MQTT-3.3.2-1]` The Topic Name MUST be present as the first field in the
-/// PUBLISH packet Variable Header.
+/// `[MQTT-4.7.3-1]` `[MQTT-4.13.1-1]` Topic Names MUST be at least one
+/// character long. A PUBLISH with an empty Topic Name and no Topic Alias must
+/// make the Server close the connection.
 #[conformance_test(
-    ids = ["MQTT-3.3.2-1"],
+    ids = ["MQTT-4.7.3-1", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn publish_topic_must_not_be_empty_without_alias(sut: SutHandle) {
@@ -91,12 +94,12 @@ async fn publish_topic_must_not_be_empty_without_alias(sut: SutHandle) {
         .await
         .unwrap();
 
-    assertions::expect_disconnect(&mut raw, "MQTT-3.3.2-1", TIMEOUT).await;
+    assertions::expect_disconnect(&mut raw, "MQTT-4.7.3-1", TIMEOUT).await;
 }
 
-/// `[MQTT-3.3.2-8]` A Topic Alias of 0 is not permitted.
+/// `[MQTT-3.3.2-8]` `[MQTT-4.13.1-1]` A Topic Alias of 0 is not permitted.
 #[conformance_test(
-    ids = ["MQTT-3.3.2-8"],
+    ids = ["MQTT-3.3.2-8", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn publish_topic_alias_zero_rejected(sut: SutHandle) {
@@ -116,10 +119,10 @@ async fn publish_topic_alias_zero_rejected(sut: SutHandle) {
     assertions::expect_disconnect(&mut raw, "MQTT-3.3.2-8", TIMEOUT).await;
 }
 
-/// `[MQTT-3.3.4-6]` A PUBLISH packet sent from a Client to a Server MUST NOT
-/// contain a Subscription Identifier.
+/// `[MQTT-3.3.4-6]` `[MQTT-4.13.1-1]` A PUBLISH packet sent from a Client to a
+/// Server MUST NOT contain a Subscription Identifier.
 #[conformance_test(
-    ids = ["MQTT-3.3.4-6"],
+    ids = ["MQTT-3.3.4-6", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn publish_subscription_id_from_client_rejected(sut: SutHandle) {
@@ -318,7 +321,7 @@ async fn publish_retain_handling_zero_sends_retained(sut: SutHandle) {
     let msgs = subscription.snapshot();
     assert!(
         msgs[0].retain,
-        "[MQTT-3.3.1-9] a retained message sent for a new subscription must have RETAIN set to 1"
+        "a retained message sent for a new subscription must have RETAIN set to 1"
     );
     publisher.disconnect().await.expect("disconnect failed");
     subscriber.disconnect().await.expect("disconnect failed");
@@ -517,9 +520,9 @@ async fn publish_retain_as_published_one_preserves_flag(sut: SutHandle) {
     subscriber.disconnect().await.expect("disconnect failed");
 }
 
-/// `[MQTT-3.3.4-1]` `QoS` 0 message delivered to subscriber.
+/// `[MQTT-4.5.0-1]` A `QoS` 0 PUBLISH is delivered to a matching subscriber.
 #[conformance_test(
-    ids = ["MQTT-3.3.4-1"],
+    ids = ["MQTT-4.5.0-1"],
     requires = ["transport.tcp"],
 )]
 async fn publish_qos0_delivery(sut: SutHandle) {
@@ -544,7 +547,7 @@ async fn publish_qos0_delivery(sut: SutHandle) {
 
     assert!(
         subscription.wait_for_messages(1, TIMEOUT).await,
-        "[MQTT-3.3.4-1] QoS 0 message must be delivered to subscriber"
+        "[MQTT-4.5.0-1] QoS 0 message must be delivered to subscriber"
     );
     let msgs = subscription.snapshot();
     assert_eq!(msgs[0].payload, b"qos0-msg");
@@ -552,10 +555,11 @@ async fn publish_qos0_delivery(sut: SutHandle) {
     subscriber.disconnect().await.expect("disconnect failed");
 }
 
-/// `[MQTT-3.3.4-1]` `QoS` 1 → broker sends PUBACK, subscriber receives
-/// message.
+/// `[MQTT-3.3.4-1]` `[MQTT-4.3.2-4]` `[MQTT-4.5.0-1]` A `QoS` 1 PUBLISH gets a
+/// PUBACK with its Packet Identifier, and the message is delivered to a
+/// matching subscriber.
 #[conformance_test(
-    ids = ["MQTT-3.3.4-1"],
+    ids = ["MQTT-3.3.4-1", "MQTT-4.3.2-4", "MQTT-4.5.0-1"],
     requires = ["transport.tcp", "max_qos>=1"],
 )]
 async fn publish_qos1_puback_response(sut: SutHandle) {
@@ -588,7 +592,7 @@ async fn publish_qos1_puback_response(sut: SutHandle) {
 
     assert!(
         subscription.wait_for_messages(1, TIMEOUT).await,
-        "[MQTT-3.3.4-1] QoS 1 message must be delivered to subscriber"
+        "[MQTT-4.5.0-1] QoS 1 message must be delivered to subscriber"
     );
     let msgs = subscription.snapshot();
     assert_eq!(msgs[0].payload, b"qos1-msg");
@@ -596,10 +600,12 @@ async fn publish_qos1_puback_response(sut: SutHandle) {
     subscriber.disconnect().await.expect("disconnect failed");
 }
 
-/// `[MQTT-3.3.4-1]` `QoS` 2 → full PUBREC/PUBREL/PUBCOMP exchange and
-/// delivery.
+/// `[MQTT-3.3.4-1]` `[MQTT-4.3.3-8]` `[MQTT-4.3.3-11]` `[MQTT-4.5.0-1]` A `QoS`
+/// 2 PUBLISH gets a PUBREC with its Packet Identifier, the PUBREL gets a
+/// PUBCOMP with the same Packet Identifier, and the message is delivered to a
+/// matching subscriber.
 #[conformance_test(
-    ids = ["MQTT-3.3.4-1"],
+    ids = ["MQTT-3.3.4-1", "MQTT-4.3.3-8", "MQTT-4.3.3-11", "MQTT-4.5.0-1"],
     requires = ["transport.tcp", "max_qos>=2"],
 )]
 async fn publish_qos2_full_flow(sut: SutHandle) {
@@ -634,7 +640,7 @@ async fn publish_qos2_full_flow(sut: SutHandle) {
         subscription
             .wait_for_messages(1, Duration::from_secs(5))
             .await,
-        "[MQTT-3.3.4-1] QoS 2 message must be delivered to subscriber"
+        "[MQTT-4.5.0-1] QoS 2 message must be delivered to subscriber"
     );
     let msgs = subscription.snapshot();
     assert_eq!(msgs[0].payload, b"qos2-msg");
@@ -873,7 +879,7 @@ async fn publish_topic_matches_subscription_filter(sut: SutHandle) {
 
     assert!(
         subscription.wait_for_messages(1, TIMEOUT).await,
-        "[MQTT-3.3.2-3] Wildcard subscription must match published topic"
+        "Wildcard subscription must match published topic"
     );
     let msgs = subscription.snapshot();
     assert_eq!(

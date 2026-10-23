@@ -1,5 +1,6 @@
 //! Section 4.7 — Topic Names and Topic Filters.
 
+use crate::assertions;
 use crate::conformance_test;
 use crate::harness::unique_client_id;
 use crate::raw_client::{RawMqttClient, RawPacketBuilder};
@@ -166,75 +167,53 @@ async fn valid_wildcard_filters_accepted(sut: SutHandle) {
     }
 }
 
-/// `[MQTT-4.7.2-1]` Topic Names beginning with `$` MUST NOT be matched by
-/// a Topic Filter starting with a wildcard character (`#` or `+`).
+/// `[MQTT-4.7.2-1]` The Server MUST NOT match Topic Filters starting with `#`
+/// or `+` with Topic Names beginning with `$`. The broker's own `$SYS`
+/// messages reach a `$SYS/#` subscription, and must not reach `#` or `+/#`.
 #[conformance_test(
     ids = ["MQTT-4.7.2-1"],
-    requires = ["transport.tcp"],
+    requires = ["transport.tcp", "sys_topics_published"],
 )]
 async fn dollar_topics_not_matched_by_root_wildcards(sut: SutHandle) {
-    let sub_hash = TestClient::connect_with_prefix(&sut, "dollar-hash")
-        .await
-        .unwrap();
-    let subscription_hash = sub_hash
-        .subscribe("#", SubscribeOptions::default())
-        .await
-        .expect("subscribe failed");
+    let mut sub_hash = assertions::subscribed_raw_client(&sut, "dollar-hash", "#", TIMEOUT).await;
+    let mut sub_plus = assertions::subscribed_raw_client(&sut, "dollar-plus", "+/#", TIMEOUT).await;
+    let mut sub_sys =
+        assertions::subscribed_raw_client(&sut, "dollar-sys", "$SYS/#", TIMEOUT).await;
 
-    let sub_plus = TestClient::connect_with_prefix(&sut, "dollar-plus")
-        .await
-        .unwrap();
-    let subscription_plus = sub_plus
-        .subscribe("+/info", SubscribeOptions::default())
-        .await
-        .expect("subscribe failed");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let publisher = TestClient::connect_with_prefix(&sut, "dollar-pub")
-        .await
-        .unwrap();
-    publisher
-        .publish("$SYS/test", b"sys-payload")
-        .await
-        .unwrap();
-    publisher.publish("$SYS/info", b"sys-info").await.unwrap();
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let dollar_on_hash: Vec<_> = subscription_hash
-        .snapshot()
-        .into_iter()
-        .filter(|m| m.topic.starts_with('$'))
-        .collect();
     assert!(
-        dollar_on_hash.is_empty(),
-        "[MQTT-4.7.2-1] # must not match $-prefixed topics, got: {:?}",
-        dollar_on_hash.iter().map(|m| &m.topic).collect::<Vec<_>>()
+        assertions::first_publish_matching(&mut sub_sys, TIMEOUT, |topic| topic
+            .starts_with("$SYS/"))
+        .await
+        .is_some(),
+        "$SYS/# must receive the broker's $SYS messages"
     );
-
-    let dollar_on_plus: Vec<_> = subscription_plus
-        .snapshot()
-        .into_iter()
-        .filter(|m| m.topic.starts_with('$'))
-        .collect();
-    assert!(
-        dollar_on_plus.is_empty(),
-        "[MQTT-4.7.2-1] +/info must not match $-prefixed topics, got: {:?}",
-        dollar_on_plus.iter().map(|m| &m.topic).collect::<Vec<_>>()
-    );
+    assertions::expect_no_publish(
+        &mut sub_hash,
+        "MQTT-4.7.2-1",
+        Duration::from_millis(500),
+        |topic| topic.starts_with('$'),
+    )
+    .await;
+    assertions::expect_no_publish(
+        &mut sub_plus,
+        "MQTT-4.7.2-1",
+        Duration::from_millis(500),
+        |topic| topic.starts_with('$'),
+    )
+    .await;
 }
 
-/// `[MQTT-4.7.2-1]` Topic Filters that explicitly include `$` (e.g.
-/// `$SYS/#`) MAY match topics beginning with `$`.
+/// `[MQTT-4.5.0-1]` On a broker that allows publishing to `$SYS`, a
+/// subscription to `$SYS/#` must receive a message published under `$SYS`.
 #[conformance_test(
-    ids = ["MQTT-4.7.2-1"],
+    ids = ["MQTT-4.5.0-1"],
     requires = ["transport.tcp", "dollar_sys_publish"],
 )]
 async fn dollar_topics_matched_by_explicit_prefix(sut: SutHandle) {
     let subscriber = TestClient::connect_with_prefix(&sut, "dollar-explicit")
         .await
         .unwrap();
+    let sys_topic = format!("$SYS/conformance/{}", unique_client_id("explicit"));
     let subscription = subscriber
         .subscribe("$SYS/#", SubscribeOptions::default())
         .await
@@ -245,7 +224,7 @@ async fn dollar_topics_matched_by_explicit_prefix(sut: SutHandle) {
     let publisher = TestClient::connect_with_prefix(&sut, "dollar-explpub")
         .await
         .unwrap();
-    publisher.publish("$SYS/test", b"payload").await.unwrap();
+    publisher.publish(&sys_topic, b"payload").await.unwrap();
 
     subscription.wait_for_messages(1, TIMEOUT).await;
 
@@ -254,8 +233,8 @@ async fn dollar_topics_matched_by_explicit_prefix(sut: SutHandle) {
     let msgs = subscription.snapshot();
     let found = msgs
         .iter()
-        .find(|m| m.topic == "$SYS/test")
-        .expect("$SYS/# must match $SYS/test");
+        .find(|m| m.topic == sys_topic)
+        .expect("$SYS/# must match the $SYS publish");
     assert_eq!(found.payload, b"payload");
 }
 
@@ -294,11 +273,11 @@ async fn topic_filter_must_not_be_empty(sut: SutHandle) {
     }
 }
 
-/// `[MQTT-4.7.3-2]` Topic Names and Topic Filters MUST NOT include the
-/// null character (U+0000). PUBLISH with a null in the topic name must
-/// cause disconnect.
+/// `[MQTT-4.7.3-2]` `[MQTT-4.13.1-1]` Topic Names and Topic Filters MUST NOT
+/// include the null character (U+0000). PUBLISH with a null in the topic name
+/// must cause disconnect.
 #[conformance_test(
-    ids = ["MQTT-4.7.3-2"],
+    ids = ["MQTT-4.7.3-2", "MQTT-4.13.1-1"],
     requires = ["transport.tcp"],
 )]
 async fn null_char_in_topic_name_rejected(sut: SutHandle) {
@@ -318,10 +297,10 @@ async fn null_char_in_topic_name_rejected(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-4.7.1-2]` The single-level wildcard `+` matches exactly one
-/// topic level — not zero, not multiple.
+/// `[MQTT-4.5.0-1]` A `+` subscription must receive messages on topics with
+/// exactly one level in its place.
 #[conformance_test(
-    ids = ["MQTT-4.7.1-2"],
+    ids = ["MQTT-4.5.0-1"],
     requires = ["transport.tcp"],
 )]
 async fn single_level_wildcard_matches_one_level(sut: SutHandle) {
@@ -363,10 +342,10 @@ async fn single_level_wildcard_matches_one_level(sut: SutHandle) {
     assert_eq!(msgs[0].topic, "sport/tennis/player");
 }
 
-/// `[MQTT-4.7.1-1]` The multi-level wildcard `#` matches the parent topic
-/// and any descendants.
+/// `[MQTT-4.5.0-1]` A `#` subscription must receive messages on the parent
+/// topic and every descendant.
 #[conformance_test(
-    ids = ["MQTT-4.7.1-1"],
+    ids = ["MQTT-4.5.0-1"],
     requires = ["transport.tcp"],
 )]
 async fn multi_level_wildcard_matches_all_descendants(sut: SutHandle) {
@@ -465,10 +444,11 @@ async fn server_delivers_to_matching_subscribers(sut: SutHandle) {
     );
 }
 
-/// `[MQTT-4.6.0-5]` Message ordering MUST be preserved per topic for the
-/// same `QoS` level.
+/// `[MQTT-4.6.0-5]` `[MQTT-4.6.0-6]` Messages published by one client to a
+/// topic at the same `QoS` must reach a non-shared subscriber in the order they
+/// were sent.
 #[conformance_test(
-    ids = ["MQTT-4.6.0-5"],
+    ids = ["MQTT-4.6.0-5", "MQTT-4.6.0-6"],
     requires = ["transport.tcp"],
 )]
 async fn message_ordering_preserved_same_qos(sut: SutHandle) {
@@ -509,9 +489,9 @@ async fn message_ordering_preserved_same_qos(sut: SutHandle) {
     }
 }
 
-/// `[MQTT-4.7.3-4]` Topic matching MUST NOT apply Unicode normalization.
-/// U+00C5 (A-ring precomposed) and U+0041 U+030A (A + combining ring)
-/// must be treated as different topics.
+/// `[MQTT-4.7.3-4]` The Server MUST NOT normalize Topic Names or Topic Filters
+/// when matching, so a filter and a topic that differ only in Unicode
+/// normalization must not match.
 #[conformance_test(
     ids = ["MQTT-4.7.3-4"],
     requires = ["transport.tcp"],
@@ -522,23 +502,10 @@ async fn topic_matching_no_unicode_normalization(sut: SutHandle) {
     let precomposed = format!("uni/{tag}/\u{00C5}");
     let decomposed = format!("uni/{tag}/A\u{030A}");
 
-    let sub_pre = TestClient::connect_with_prefix(&sut, "sub-pre")
-        .await
-        .unwrap();
-    let subscription_pre = sub_pre
-        .subscribe(&precomposed, SubscribeOptions::default())
-        .await
-        .expect("subscribe failed");
-
-    let sub_dec = TestClient::connect_with_prefix(&sut, "sub-dec")
-        .await
-        .unwrap();
-    let subscription_dec = sub_dec
-        .subscribe(&decomposed, SubscribeOptions::default())
-        .await
-        .expect("subscribe failed");
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut sub_pre =
+        assertions::subscribed_raw_client(&sut, "sub-pre", &precomposed, TIMEOUT).await;
+    let mut sub_dec =
+        assertions::subscribed_raw_client(&sut, "sub-dec", &decomposed, TIMEOUT).await;
 
     let publisher = TestClient::connect_with_prefix(&sut, "pub-unicode")
         .await
@@ -547,32 +514,30 @@ async fn topic_matching_no_unicode_normalization(sut: SutHandle) {
         .publish(&precomposed, b"precomposed")
         .await
         .unwrap();
-
-    assert!(
-        subscription_pre.wait_for_messages(1, TIMEOUT).await,
+    assert_eq!(
+        assertions::first_publish_matching(&mut sub_pre, TIMEOUT, |_| true).await,
+        Some(precomposed.clone()),
         "precomposed subscriber must receive message on precomposed topic"
     );
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        subscription_dec.count(),
-        0,
-        "[MQTT-4.7.3-4] decomposed subscriber must NOT receive message on precomposed topic \
-         (no Unicode normalization)"
-    );
+    assertions::expect_no_publish(
+        &mut sub_dec,
+        "MQTT-4.7.3-4",
+        Duration::from_millis(300),
+        |_| true,
+    )
+    .await;
 
     publisher.publish(&decomposed, b"decomposed").await.unwrap();
-
-    assert!(
-        subscription_dec.wait_for_messages(1, TIMEOUT).await,
+    assert_eq!(
+        assertions::first_publish_matching(&mut sub_dec, TIMEOUT, |_| true).await,
+        Some(decomposed.clone()),
         "decomposed subscriber must receive message on decomposed topic"
     );
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let pre_msgs = subscription_pre.snapshot();
-    assert_eq!(
-        pre_msgs.len(),
-        1,
-        "[MQTT-4.7.3-4] precomposed subscriber must NOT receive message on decomposed topic"
-    );
+    assertions::expect_no_publish(
+        &mut sub_pre,
+        "MQTT-4.7.3-4",
+        Duration::from_millis(300),
+        |_| true,
+    )
+    .await;
 }
