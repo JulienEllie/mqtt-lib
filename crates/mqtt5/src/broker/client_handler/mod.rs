@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, timeout, timeout_at, Instant, Interval};
+use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{debug, info, warn};
 
 /// Longest a new connection waits for the handler it displaced to hand the session over.
@@ -125,6 +125,7 @@ pub struct ClientHandler {
     pub(super) client_id: Option<String>,
     pub(super) user_id: Option<String>,
     pub(super) keep_alive: Duration,
+    pub(super) last_packet_time: Instant,
     pub(super) qos1_rx: mpsc::Receiver<RoutableMessage>,
     pub(super) qos1_tx: mpsc::Sender<RoutableMessage>,
     pub(super) qos0_rx: mpsc::Receiver<RoutableMessage>,
@@ -244,6 +245,7 @@ impl ClientHandler {
             client_id: None,
             user_id: None,
             keep_alive: Duration::from_secs(60),
+            last_packet_time: Instant::now(),
             qos1_rx,
             qos1_tx,
             qos0_rx,
@@ -482,14 +484,7 @@ impl ClientHandler {
         if self.released_rx.is_none() {
             self.bind().await?;
         }
-        if self.keep_alive.is_zero() {
-            self.handle_packets(None, disconnect_rx).await
-        } else {
-            let mut keep_alive_interval = interval(self.keep_alive);
-            keep_alive_interval.reset();
-            self.handle_packets(Some(&mut keep_alive_interval), disconnect_rx)
-                .await
-        }
+        self.handle_packets(disconnect_rx).await
     }
 
     async fn bind(&mut self) -> Result<()> {
@@ -842,6 +837,7 @@ impl ClientHandler {
             self.read_share.as_mut(),
         )
         .await?;
+        self.last_packet_time = Instant::now();
         let Packet::Connect(connect) = packet else {
             return Err(MqttError::ProtocolError(
                 "Expected CONNECT packet".to_string(),
@@ -873,6 +869,7 @@ impl ClientHandler {
                 self.read_share.as_mut(),
             )
             .await?;
+            self.last_packet_time = Instant::now();
             let Packet::Auth(auth) = packet else {
                 return Err(MqttError::ProtocolError(
                     "Only AUTH may follow CONNECT before CONNACK".to_string(),
@@ -894,17 +891,18 @@ impl ClientHandler {
         }
     }
 
-    /// Zombie guard for one transport write; never long enough to push a live client past
-    /// its keep-alive limit on its own.
     pub(super) fn write_timeout(&self) -> Duration {
-        if self.keep_alive.is_zero() {
-            Duration::from_secs(300)
-        } else {
-            KeepaliveConfig::default()
-                .timeout_duration(self.keep_alive)
+        match self.keep_alive_limit() {
+            None => Duration::from_secs(300),
+            Some(limit) => limit
                 .saturating_sub(self.batch_time_budget())
-                .max(Duration::from_secs(1))
+                .max(Duration::from_secs(1)),
         }
+    }
+
+    fn keep_alive_limit(&self) -> Option<Duration> {
+        (!self.keep_alive.is_zero())
+            .then(|| KeepaliveConfig::default().timeout_duration(self.keep_alive))
     }
 
     fn session_preserved(&self) -> bool {
@@ -1047,12 +1045,10 @@ impl ClientHandler {
 
     async fn handle_packets(
         &mut self,
-        mut keep_alive_interval: Option<&mut Interval>,
         disconnect_rx: &mut oneshot::Receiver<TakeoverNotice>,
     ) -> Result<LoopExit> {
-        let mut last_packet_time = Instant::now();
         let max_size = self.max_packet_size();
-        let read_timeout = self.read_timeout();
+        let read_limit = self.read_limit();
         let queue = self.queue.clone();
 
         loop {
@@ -1073,11 +1069,11 @@ impl ClientHandler {
                     self.bind().await?;
                 }
 
-                read_result = timeout(read_timeout, Self::read_control_packet(&mut self.transport, self.protocol_version, &mut self.read_buffer, max_size, self.read_share.as_mut())) => {
-                    if let Some(exit) = self.handle_read(read_result, read_timeout).await? {
+                read_result = timeout_at(self.last_packet_time + read_limit, Self::read_control_packet(&mut self.transport, self.protocol_version, &mut self.read_buffer, max_size, self.read_share.as_mut())) => {
+                    self.last_packet_time = Instant::now();
+                    if let Some(exit) = self.handle_read(read_result, read_limit).await? {
                         return Ok(exit);
                     }
-                    last_packet_time = Instant::now();
                 }
 
                 external_packet = async {
@@ -1087,9 +1083,10 @@ impl ClientHandler {
                         std::future::pending::<Option<ExternalInput>>().await
                     }
                 } => {
-                    if self.handle_external_packet(external_packet).await? {
-                        last_packet_time = Instant::now();
+                    if external_packet.is_some() {
+                        self.last_packet_time = Instant::now();
                     }
+                    self.handle_external_packet(external_packet).await?;
                 }
 
                 () = async move {
@@ -1129,17 +1126,6 @@ impl ClientHandler {
                     self.drain_backlog().await?;
                 }
 
-                () = async {
-                    match keep_alive_interval.as_deref_mut() {
-                        Some(interval) => {
-                            interval.tick().await;
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    self.check_keep_alive(last_packet_time)?;
-                }
-
                 notice = &mut *disconnect_rx => {
                     let Ok(notice) = notice else {
                         debug!("Router dropped this connection's entry");
@@ -1157,32 +1143,28 @@ impl ClientHandler {
         }
     }
 
-    fn read_timeout(&self) -> Duration {
-        if self.keep_alive.is_zero() {
-            Duration::from_secs(300)
-        } else {
-            self.keep_alive.mul_f32(1.5)
-        }
+    fn read_limit(&self) -> Duration {
+        self.keep_alive_limit().unwrap_or(Duration::from_secs(300))
     }
 
     async fn handle_external_packet(
         &mut self,
         external_packet: Option<ExternalInput>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let (packet, flow_id, permit) = match external_packet {
-            None => return Ok(false),
+            None => return Ok(()),
             Some(ExternalInput::Packet(packet, flow_id, permit)) => (packet, flow_id, permit),
             #[cfg(all(not(target_arch = "wasm32"), feature = "transport-quic"))]
             Some(ExternalInput::Flow(input)) => {
                 self.handle_flow_input(input).await;
-                return Ok(true);
+                return Ok(());
             }
         };
         self.pending_external_flow_id = flow_id;
         let result = self.handle_packet(packet).await;
         drop(permit);
         self.pending_external_flow_id = None;
-        result.map(|()| true)
+        result
     }
 
     async fn deliver_from_lane(
@@ -1198,23 +1180,18 @@ impl ClientHandler {
         Ok(None)
     }
 
-    fn check_keep_alive(&self, last_packet_time: Instant) -> Result<()> {
-        let timeout_duration = KeepaliveConfig::default().timeout_duration(self.keep_alive);
-        if last_packet_time.elapsed() > timeout_duration {
-            warn!("Keep-alive timeout");
-            return Err(MqttError::KeepAliveTimeout);
-        }
-        Ok(())
-    }
-
     async fn handle_read(
         &mut self,
         read_result: std::result::Result<Result<Packet>, tokio::time::error::Elapsed>,
-        read_timeout: Duration,
+        read_limit: Duration,
     ) -> Result<Option<LoopExit>> {
         let packet_result = read_result.map_err(|_| {
-            warn!("Read timeout (no data for {read_timeout:?})");
-            MqttError::Timeout
+            warn!("No packet received within {read_limit:?}");
+            if self.keep_alive.is_zero() {
+                MqttError::Timeout
+            } else {
+                MqttError::KeepAliveTimeout
+            }
         })?;
         match packet_result {
             Ok(packet) => {

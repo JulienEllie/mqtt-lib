@@ -4,6 +4,7 @@ use bytes::BytesMut;
 use mqtt5_protocol::packet::connack::ConnAckPacket;
 use mqtt5_protocol::packet::connect::ConnectPacket;
 use mqtt5_protocol::packet::disconnect::DisconnectPacket;
+use mqtt5_protocol::packet::pingreq::PingReqPacket;
 use mqtt5_protocol::packet::{FixedHeader, MqttPacket};
 use mqtt5_protocol::protocol::v5::reason_codes::ReasonCode;
 use mqtt5_protocol::types::{ConnectOptions, WillMessage};
@@ -368,6 +369,75 @@ async fn keep_alive_expiry_publishes_will() {
     );
 
     drop(silent);
+    watcher.disconnect().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn keep_alive_expiry_closes_after_one_and_a_half_keep_alives() {
+    let broker = broker();
+    let client_id = "wasm-wd-keepalive-timing";
+    let (watcher, count) = watch_will(&broker, client_id).await;
+
+    let silent = RawClient::connect_with_keep_alive(
+        &broker,
+        client_id,
+        true,
+        SESSION_EXPIRY,
+        Some(delayed_will(client_id, 0)),
+        1,
+    )
+    .await;
+    let connected_at = now_ms();
+
+    assert!(
+        wait_for_will(&count, 4000).await,
+        "the Will must be published"
+    );
+    let elapsed = now_ms() - connected_at;
+    assert!(
+        (1400.0..1900.0).contains(&elapsed),
+        "the broker closed the silent client after {elapsed}ms; expected ~1500ms (1s * 1.5)"
+    );
+
+    drop(silent);
+    watcher.disconnect().await.unwrap();
+}
+
+#[wasm_bindgen_test]
+async fn pingreq_within_keep_alive_keeps_the_connection() {
+    let broker = broker();
+    let client_id = "wasm-wd-keepalive-ping";
+    let (watcher, count) = watch_will(&broker, client_id).await;
+
+    let pinging = RawClient::connect_with_keep_alive(
+        &broker,
+        client_id,
+        true,
+        SESSION_EXPIRY,
+        Some(delayed_will(client_id, 0)),
+        1,
+    )
+    .await;
+
+    for sent in 1..=4 {
+        sleep(800).await;
+        pinging.send(&PingReqPacket::default());
+        let deadline = now_ms() + 500.0;
+        while pingresp_count(&pinging) < sent && now_ms() < deadline {
+            sleep(10).await;
+        }
+        assert_eq!(
+            pingresp_count(&pinging),
+            sent,
+            "PINGREQ {sent}, sent within the Keep Alive, must be answered"
+        );
+    }
+    assert!(
+        !wait_for_will(&count, 500).await,
+        "a client sending PINGREQ within its Keep Alive must stay connected"
+    );
+
+    drop(pinging);
     watcher.disconnect().await.unwrap();
 }
 
@@ -749,6 +819,19 @@ fn send_publish(client: &RawClient, topic: &str) {
     publish.extend_from_slice(topic.as_bytes());
     publish.extend_from_slice(&[0x00, b'h', b'i']);
     send_raw(client, &publish);
+}
+
+fn pingresp_count(client: &RawClient) -> usize {
+    let inbox = client.inbox.borrow().clone();
+    let mut i = usize::from(inbox[1]) + 2;
+    let mut count = 0;
+    while i + 1 < inbox.len() {
+        if inbox[i] == 0xD0 {
+            count += 1;
+        }
+        i += usize::from(inbox[i + 1]) + 2;
+    }
+    count
 }
 
 fn received_publish(client: &RawClient) -> bool {
