@@ -61,7 +61,8 @@ enum AckOutcome {
 }
 
 struct SubscriptionEntry {
-    filter: String,
+    subscribed_filter: String,
+    matching_filter: String,
     queue: MessageQueue,
 }
 
@@ -343,7 +344,8 @@ impl RawTestClient {
         {
             let mut subs = self.shared.subscriptions.lock().unwrap();
             subs.push(SubscriptionEntry {
-                filter: matching_filter.to_string(),
+                subscribed_filter: filter.to_string(),
+                matching_filter: matching_filter.to_string(),
                 queue: Arc::clone(&messages),
             });
         }
@@ -394,7 +396,7 @@ impl RawTestClient {
     pub async fn unsubscribe(&self, filter: &str) -> Result<(), TestClientError> {
         {
             let mut subs = self.shared.subscriptions.lock().unwrap();
-            subs.retain(|entry| entry.filter != filter);
+            subs.retain(|entry| entry.subscribed_filter != filter);
         }
 
         let packet_id = self.allocate_packet_id();
@@ -615,7 +617,7 @@ async fn handle_publish(
     let entries: Vec<MessageQueue> = {
         let subs = shared.subscriptions.lock().unwrap();
         subs.iter()
-            .filter(|entry| topic_matches_filter(&topic, &entry.filter))
+            .filter(|entry| topic_matches_filter(&topic, &entry.matching_filter))
             .map(|entry| Arc::clone(&entry.queue))
             .collect()
     };
@@ -737,5 +739,81 @@ mod tests {
 
         subscriber.disconnect().await.unwrap();
         publisher.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_unsubscribe_stops_local_delivery() {
+        let fixture = InProcessFixture::start().await;
+        let addr = fixture.tcp_socket_addr();
+        let topic = format!("raw/test/shared-unsub/{}", Ulid::new());
+        let shared_filter = format!("$share/group/{topic}");
+
+        let sub_opts = ConnectOptions::new(format!("conf-raw-test-sub-{}", Ulid::new()));
+        let subscriber = RawTestClient::connect(addr, sub_opts).await.unwrap();
+        let shared = subscriber
+            .subscribe(&shared_filter, SubscribeOptions::default())
+            .await
+            .unwrap();
+        subscriber.unsubscribe(&shared_filter).await.unwrap();
+        let plain = subscriber
+            .subscribe(&topic, SubscribeOptions::default())
+            .await
+            .unwrap();
+
+        let pub_opts = ConnectOptions::new(format!("conf-raw-test-pub-{}", Ulid::new()));
+        let publisher = RawTestClient::connect(addr, pub_opts).await.unwrap();
+        publisher
+            .publish_with_options(&topic, b"after", PublishOptions::default())
+            .await
+            .unwrap();
+
+        plain
+            .expect_publish(Duration::from_secs(3))
+            .await
+            .expect("plain subscription should receive the message");
+        assert_eq!(
+            shared.count(),
+            0,
+            "the unsubscribed shared subscription must not receive messages"
+        );
+
+        subscriber.disconnect().await.unwrap();
+        publisher.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_unsubscribe_keeps_plain_subscription() {
+        let fixture = InProcessFixture::start().await;
+        let addr = fixture.tcp_socket_addr();
+        let topic = format!("raw/test/shared-unsub-plain/{}", Ulid::new());
+        let shared_filter = format!("$share/group/{topic}");
+
+        let sub_opts = ConnectOptions::new(format!("conf-raw-test-sub-{}", Ulid::new()));
+        let subscriber = RawTestClient::connect(addr, sub_opts).await.unwrap();
+        subscriber
+            .subscribe(&topic, SubscribeOptions::default())
+            .await
+            .unwrap();
+        subscriber
+            .subscribe(&shared_filter, SubscribeOptions::default())
+            .await
+            .unwrap();
+        subscriber.unsubscribe(&shared_filter).await.unwrap();
+
+        let remaining: Vec<String> = subscriber
+            .shared
+            .subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.subscribed_filter.clone())
+            .collect();
+        assert_eq!(
+            remaining,
+            [topic],
+            "unsubscribing the shared filter must keep the plain subscription"
+        );
+
+        subscriber.disconnect().await.unwrap();
     }
 }

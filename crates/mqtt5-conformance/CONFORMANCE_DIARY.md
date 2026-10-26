@@ -39,6 +39,45 @@
 
 ## Diary Entries
 
+### Review fixes for the follow-up test bugs (2026-10-26)
+
+**Trigger**: a code review of PR #267 raised 10 findings. Each one was checked at runtime before any fix. Broker mutations were made in this worktree and reverted afterwards.
+
+**Confirmed and fixed**:
+- The shared unsubscribe fix in the entry below was wrong. `TestClient`'s raw backend compared the filter without its `$share/<name>/` prefix, so unsubscribing `$share/group/t` also removed a plain `t` subscription on the same client. Entries now keep the filter they were subscribed with, and unsubscribe matches it exactly (MQTT-3.10.4-1 compares filters character by character). Against Mosquitto on port 21884, a delivery test fails on the old code and passes on the new one. New unit test `shared_unsubscribe_keeps_plain_subscription` checks the client's subscription list instead (left `[]` on the old code), because our broker has its own bug here (see below).
+- `server_delivers_to_matching_subscribers` lost its payload check in the rewrite. Control: a router that empties every payload passes the PR's version and fails both the old version and the fixed one ("the delivered message must carry the published payload").
+- Server Keep Alive handling in the keep alive tests. With `--keep-alive 0` the broker sends Server Keep Alive 0, and `keepalive_timeout_closes_connection` failed a compliant broker. `keepalive_zero_no_timeout` slept 0 s and still reported MQTT-3.2.2-22 as passed. With `--keep-alive 600` the timeout test ran for 900.00 s. The CLI cannot skip a test while it runs, so the three keep alive tests now need a new requirement, `no_server_keep_alive`, which matches `server_keep_alive = 0` in the profile. The tests fail with "the CONNACK carries Server Keep Alive ..., but the SUT profile declares server_keep_alive = 0" when the profile is wrong. With `server_keep_alive = 600` in the profile, all three are skipped.
+- `pingreq_resets_keepalive` never read the CONNACK, although the CHANGELOG said the keep alive tests did. It is now covered by the same requirement and CONNACK check.
+- The `assertions.rs` module doc said every helper takes a statement ID. `expect_no_publish` takes a context that callers bracket themselves. All callers already did.
+
+**Keep alive margin**: a broker mutated to close at twice the Keep Alive passed the old 4 s window at Keep Alive 2 in 1 of 3 runs, since it closes at 4.0 s. Probe measurements of the close time: our broker 6.002 s at Keep Alive 4; Mosquitto 3.95 to 3.97 s at Keep Alive 2, 6.6 to 6.9 s at 4, and 9.14 to 9.96 s at 6. Mosquitto is up to about 1 s late at every Keep Alive, so the old window passed it by about 40 ms. The test now uses Keep Alive 6 and waits 11 s. The 2x mutant fails 3 of 3 runs. Our broker passes in 9.00 s and Mosquitto in 9.45 to 10.05 s, 3 of 3 each.
+
+**Not reproduced, left unchanged**: the PINGREQ loop in `connack_assigned_client_id_unique` calls `send_raw(...).unwrap()`. Against a broker mutated to close every connection with an assigned ID right after CONNACK, the write succeeded in 6 of 6 runs, and the tagged `[MQTT-3.2.2-16]` assertion fired.
+
+**Left for separate work**: `read_packet_bytes` and `expect_disconnect` read the socket directly, while `read_mqtt_packet` keeps leftover bytes in `self.buf`, so bytes it buffered are invisible to the other readers. The duplicate empty ClientID CONNECT builders in `section3_connack.rs` and `section3_connect.rs` stay.
+
+**Broker finding**: our router keys a subscription by client and flow under the filter without its share prefix. So `$share/g/t` replaces the same client's plain `t` subscription, and unsubscribing `$share/g/t` removes it. A raw probe that subscribes to both and publishes once: mqttv5 delivers 1 copy and then 0 after unsubscribing the shared filter; Mosquitto delivers 2 and then 1. Section 4.8.2 says a Client with both gets a copy through the Non-shared Subscription, and a second through the Shared Subscription. Not fixed here.
+
+**Results**: conformance lib tests 241 passed, `manifest_load` 12 passed, integration test files pass; CLI against the in-process broker 191 passed, 3 skipped; against an external `mqttv5` broker on port 21883, 191 passed, 3 skipped; against a local Mosquitto on port 21884 with TLS and WebSocket off in the profile, 187 passed, 7 skipped; fmt and the four pedantic clippy runs clean.
+
+### Follow-up test bugs from the statement ID audit (2026-10-24)
+
+**Trigger**: the test bugs listed in the audit entry below.
+
+**Fixed** (each checked with a broker mutation in this worktree, reverted afterwards):
+- `TestClient`'s raw backend now matches the stripped filter when it removes a shared subscription on UNSUBSCRIBE. New unit test `shared_unsubscribe_stops_local_delivery` fails on the old code (left 1, right 0) and passes now.
+- `puback_message_delivered_on_qos1` publishes at QoS 1 on a unique topic and checks the delivered QoS. That check is MQTT-3.8.4-8 for min(1, 1), which none of its other tests covered, so the test now cites it. Control: `effective_qos` returns QoS 0 for a QoS 1 message on a QoS 1 subscription; the new test fails, the old one passes.
+- `qos1_server_outbound_unique_nonzero_id_and_dup_zero` receives three PUBLISHes before acknowledging any, so the uniqueness check only covers Packet Identifiers that are in use, as MQTT-2.2.1-4 says. `expect_publish_with_id` now reads one framed packet, since the three PUBLISHes can arrive in one read. Controls: a broker that always allocates the lowest free ID, which is compliant, passes the new test and fails the old one ("duplicate: 1"); a broker that sends every PUBLISH with ID 7 fails the new test.
+- `unsuback_reason_codes_are_valid_spec_values` accepts 0x8F and 0x91, checked against the UNSUBACK Reason Code table in 3.11.3.
+- `single_level_wildcard_matches_one_level` and `server_delivers_to_matching_subscribers` read with `RawMqttClient` and `expect_no_publish`, on unique topics. Their negative checks have no numbered statement, so their messages carry no tag. `expect_no_publish` takes a context label instead of a bare statement ID. Controls: a router that delivers to every wildcard and exact subscriber fails both new tests and passes both old ones; with only exact filters over-delivered, the non-matching subscriber check in `server_delivers_to_matching_subscribers` fails on its own.
+- `connack_assigned_client_id_unique` keeps both connections open and requires a PINGRESP on each. Controls: a broker that assigns `auto-fixed` to every client fails both versions; a broker that assigns `auto-fixed` unless a connected session holds it, which MQTT-3.2.2-16 allows, passes the new test and fails the old one in 3 of 3 runs.
+- `connect_empty_client_id_server_assigns` decodes the CONNACK instead of searching for a 0x12 byte.
+- The keep alive tests read the CONNACK's Server Keep Alive. `keepalive_timeout_closes_connection` waits 1.5 times the Keep Alive in force plus 1 s.
+
+**Broker finding**: with the 1 s margin, `keepalive_timeout_closes_connection` failed against our broker. A Python probe sending CONNECT with no traffic afterwards, and a CONNACK with no Server Keep Alive, measured the close at 2.005 s, 4.008 s, 8.007 s and 12.006 s for Keep Alive 1, 2, 4 and 6: twice the Keep Alive, not 1.5 times (MQTT-3.1.2-22). The old 5 s window hid this. Fixed in #266, which also counts the Keep Alive from when a packet arrives and fixes the wasm broker's late close. The test passes on this branch after rebasing onto it.
+
+**Results**: conformance lib tests 239 passed, `manifest_load` 12 passed, integration test files pass; CLI against the in-process broker 191 passed, 3 skipped; CLI against an external `mqttv5` broker (on port 21883, since 1883 is in use here) 191 passed, 3 skipped; fmt and the four pedantic clippy runs clean.
+
 ### Review fixes for the statement ID audit (2026-10-23)
 
 **Trigger**: code review of PR #265 (10 findings). Nine were confirmed against the code and fixed; one was not taken.
