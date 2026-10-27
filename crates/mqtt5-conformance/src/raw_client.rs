@@ -6,7 +6,7 @@
 //! [`RawPacketBuilder`] constructs both valid and deliberately invalid MQTT
 //! v5.0 packets for conformance edge-case testing.
 
-use crate::packet_parser::decode_variable_int;
+use crate::packet_parser::{decode_variable_int, ParsedPublish};
 use crate::transport::{TcpTransport, Transport};
 use bytes::{BufMut, BytesMut};
 use mqtt5_protocol::packet::connack::ConnAckPacket;
@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
 
-fn parse_ack_reason_codes(data: &[u8], packet_type: u8) -> Option<(u16, Vec<u8>)> {
+pub(crate) fn parse_ack_reason_codes(data: &[u8], packet_type: u8) -> Option<(u16, Vec<u8>)> {
     if data.first() != Some(&packet_type) {
         return None;
     }
@@ -91,7 +91,32 @@ impl<T: Transport> RawMqttClient<T> {
     }
 
     pub async fn read_packet_bytes(&mut self, timeout_dur: Duration) -> Option<Vec<u8>> {
-        self.read_mqtt_packet(timeout_dur).await
+        match self
+            .read_until(tokio::time::Instant::now() + timeout_dur)
+            .await
+        {
+            ReadOutcome::Packet(pkt) => Some(pkt),
+            ReadOutcome::Closed | ReadOutcome::TimedOut => None,
+        }
+    }
+
+    pub async fn read_publish_packets(&mut self, timeout_dur: Duration) -> Vec<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let mut publishes = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return publishes;
+            }
+            match self
+                .read_packet_bytes(remaining.min(Duration::from_millis(500)))
+                .await
+            {
+                Some(data) if data[0] >> 4 == 3 => publishes.push(data),
+                Some(_) => {}
+                None => return publishes,
+            }
+        }
     }
 
     /// Reads and parses a CONNACK packet, returning `(flags, reason_code)`.
@@ -103,31 +128,11 @@ impl<T: Transport> RawMqttClient<T> {
         if data.len() < 4 || data[0] != 0x20 {
             return None;
         }
-        let remaining_start = 1;
-        let mut idx = remaining_start;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
+        let (remaining_len, idx) = decode_variable_int(&data, 1)?;
         if data.len() < idx + remaining_len as usize || remaining_len < 2 {
             return None;
         }
-        let flags = data[idx];
-        let reason_code = data[idx + 1];
-        Some((flags, reason_code))
+        Some((data[idx], data[idx + 1]))
     }
 
     /// Reads and parses a fully decoded [`ConnAckPacket`] from the broker.
@@ -221,43 +226,8 @@ impl<T: Transport> RawMqttClient<T> {
     /// Returns `None` if the packet is not a `QoS` 2 PUBLISH or the timeout elapses.
     pub async fn expect_publish_qos2(&mut self, timeout_dur: Duration) -> Option<u16> {
         let data = self.read_packet_bytes(timeout_dur).await?;
-        if data.is_empty() || (data[0] & 0xF0) != 0x30 {
-            return None;
-        }
-        let qos = (data[0] >> 1) & 0x03;
-        if qos != 2 {
-            return None;
-        }
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
-        if data.len() < idx + remaining_len as usize {
-            return None;
-        }
-        if idx + 2 > data.len() {
-            return None;
-        }
-        let topic_len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-        idx += 2 + topic_len;
-        if idx + 2 > data.len() {
-            return None;
-        }
-        Some(u16::from_be_bytes([data[idx], data[idx + 1]]))
+        let publish = ParsedPublish::parse(&data)?;
+        publish.packet_id.filter(|_| publish.qos == 2)
     }
 
     /// Reads one packet and parses it as a SUBACK, returning
@@ -265,7 +235,7 @@ impl<T: Transport> RawMqttClient<T> {
     ///
     /// Returns `None` if the packet is not a valid SUBACK or the timeout elapses.
     pub async fn expect_suback(&mut self, timeout_dur: Duration) -> Option<(u16, Vec<u8>)> {
-        let data = self.read_mqtt_packet(timeout_dur).await?;
+        let data = self.read_packet_bytes(timeout_dur).await?;
         parse_ack_reason_codes(&data, 0x90)
     }
 
@@ -274,7 +244,7 @@ impl<T: Transport> RawMqttClient<T> {
     ///
     /// Returns `None` if the packet is not a valid UNSUBACK or the timeout elapses.
     pub async fn expect_unsuback(&mut self, timeout_dur: Duration) -> Option<(u16, Vec<u8>)> {
-        let data = self.read_mqtt_packet(timeout_dur).await?;
+        let data = self.read_packet_bytes(timeout_dur).await?;
         parse_ack_reason_codes(&data, 0xB0)
     }
 
@@ -284,66 +254,8 @@ impl<T: Transport> RawMqttClient<T> {
     /// Returns `None` if the packet is not a PUBLISH or the timeout elapses.
     pub async fn expect_publish(&mut self, timeout_dur: Duration) -> Option<(u8, String, Vec<u8>)> {
         let data = self.read_packet_bytes(timeout_dur).await?;
-        if data.is_empty() || (data[0] & 0xF0) != 0x30 {
-            return None;
-        }
-        let qos = (data[0] >> 1) & 0x03;
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
-        let payload_start = idx;
-        if data.len() < payload_start + remaining_len as usize {
-            return None;
-        }
-        if idx + 2 > data.len() {
-            return None;
-        }
-        let topic_len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-        idx += 2;
-        if idx + topic_len > data.len() {
-            return None;
-        }
-        let topic = String::from_utf8_lossy(&data[idx..idx + topic_len]).to_string();
-        idx += topic_len;
-        if qos > 0 {
-            idx += 2;
-        }
-        let mut props_len: u32 = 0;
-        let mut props_shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            props_len |= u32::from(byte & 0x7F) << props_shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            props_shift += 7;
-            if props_shift > 21 {
-                return None;
-            }
-        }
-        idx += props_len as usize;
-        let end = payload_start + remaining_len as usize;
-        let payload = data[idx..end].to_vec();
-        Some((qos, topic, payload))
+        let publish = ParsedPublish::parse(&data)?;
+        Some((publish.qos, publish.topic, publish.payload))
     }
 
     /// Reads and parses a PUBLISH packet, returning `(first_byte, qos, topic, payload)`.
@@ -356,67 +268,8 @@ impl<T: Transport> RawMqttClient<T> {
         timeout_dur: Duration,
     ) -> Option<(u8, u8, String, Vec<u8>)> {
         let data = self.read_packet_bytes(timeout_dur).await?;
-        if data.is_empty() || (data[0] & 0xF0) != 0x30 {
-            return None;
-        }
-        let first_byte = data[0];
-        let qos = (first_byte >> 1) & 0x03;
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
-        let payload_start = idx;
-        if data.len() < payload_start + remaining_len as usize {
-            return None;
-        }
-        if idx + 2 > data.len() {
-            return None;
-        }
-        let topic_len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-        idx += 2;
-        if idx + topic_len > data.len() {
-            return None;
-        }
-        let topic = String::from_utf8_lossy(&data[idx..idx + topic_len]).to_string();
-        idx += topic_len;
-        if qos > 0 {
-            idx += 2;
-        }
-        let mut props_len: u32 = 0;
-        let mut props_shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            props_len |= u32::from(byte & 0x7F) << props_shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            props_shift += 7;
-            if props_shift > 21 {
-                return None;
-            }
-        }
-        idx += props_len as usize;
-        let end = payload_start + remaining_len as usize;
-        let payload = data[idx..end].to_vec();
-        Some((first_byte, qos, topic, payload))
+        let publish = ParsedPublish::parse(&data)?;
+        Some((data[0], publish.qos, publish.topic, publish.payload))
     }
 
     /// Reads and parses a PUBLISH packet, returning `(first_byte, packet_id, qos, topic, payload)`.
@@ -429,75 +282,15 @@ impl<T: Transport> RawMqttClient<T> {
         &mut self,
         timeout_dur: Duration,
     ) -> Option<(u8, u16, u8, String, Vec<u8>)> {
-        let data = self.read_mqtt_packet(timeout_dur).await?;
-        if data.is_empty() || (data[0] & 0xF0) != 0x30 {
-            return None;
-        }
-        let first_byte = data[0];
-        let qos = (first_byte >> 1) & 0x03;
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
-        let payload_start = idx;
-        if data.len() < payload_start + remaining_len as usize {
-            return None;
-        }
-        if idx + 2 > data.len() {
-            return None;
-        }
-        let topic_len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-        idx += 2;
-        if idx + topic_len > data.len() {
-            return None;
-        }
-        let topic = String::from_utf8_lossy(&data[idx..idx + topic_len]).to_string();
-        idx += topic_len;
-        let packet_id = if qos > 0 {
-            if idx + 2 > data.len() {
-                return None;
-            }
-            let pid = u16::from_be_bytes([data[idx], data[idx + 1]]);
-            idx += 2;
-            pid
-        } else {
-            0
-        };
-        let mut props_len: u32 = 0;
-        let mut props_shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            props_len |= u32::from(byte & 0x7F) << props_shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            props_shift += 7;
-            if props_shift > 21 {
-                return None;
-            }
-        }
-        idx += props_len as usize;
-        let end = payload_start + remaining_len as usize;
-        let payload = data[idx..end].to_vec();
-        Some((first_byte, packet_id, qos, topic, payload))
+        let data = self.read_packet_bytes(timeout_dur).await?;
+        let publish = ParsedPublish::parse(&data)?;
+        Some((
+            data[0],
+            publish.packet_id.unwrap_or(0),
+            publish.qos,
+            publish.topic,
+            publish.payload,
+        ))
     }
 
     /// Reads and checks whether the next packet is a PINGRESP (`0xD0 0x00`).
@@ -518,27 +311,10 @@ impl<T: Transport> RawMqttClient<T> {
     /// or the connection is closed without sending DISCONNECT.
     pub async fn expect_disconnect_packet(&mut self, timeout_dur: Duration) -> Option<u8> {
         let data = self.read_packet_bytes(timeout_dur).await?;
-        if data.is_empty() || data[0] != 0xE0 {
+        if data.first() != Some(&0xE0) {
             return None;
         }
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
+        let (remaining_len, idx) = decode_variable_int(&data, 1)?;
         if remaining_len == 0 {
             return Some(0x00);
         }
@@ -557,51 +333,23 @@ impl<T: Transport> RawMqttClient<T> {
         Some(data)
     }
 
-    /// Reads raw bytes within timeout and returns `Option<Vec<u8>>`.
-    ///
-    /// Alias of [`Self::read_packet_bytes`] for readability in tests that accept
-    /// any packet type without inspecting the contents.
-    pub async fn expect_any_packet(&mut self, timeout_dur: Duration) -> Option<Vec<u8>> {
-        self.read_packet_bytes(timeout_dur).await
-    }
-
     /// Reads an AUTH packet and returns `(reason_code, auth_method)`.
     pub async fn expect_auth_packet(
         &mut self,
         timeout_dur: Duration,
     ) -> Option<(u8, Option<String>)> {
         let data = self.read_packet_bytes(timeout_dur).await?;
-        if data.is_empty() || data[0] != 0xF0 {
+        if data.first() != Some(&0xF0) {
             return None;
         }
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= data.len() {
-                return None;
-            }
-            let byte = data[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return None;
-            }
-        }
+        let (remaining_len, idx) = decode_variable_int(&data, 1)?;
         if remaining_len == 0 {
             return Some((0x00, None));
         }
         if data.len() < idx + remaining_len as usize {
             return None;
         }
-        let reason_code = data[idx];
-        idx += 1;
-        let auth_method = extract_auth_method_property(&data, idx);
-        Some((reason_code, auth_method))
+        Some((data[idx], extract_auth_method_property(&data, idx + 1)))
     }
 
     pub async fn expect_disconnect(&mut self, timeout_dur: Duration) -> bool {
@@ -619,29 +367,14 @@ impl<T: Transport> RawMqttClient<T> {
         if buf.is_empty() {
             return None;
         }
-        let mut idx = 1;
-        let mut remaining_len: u32 = 0;
-        let mut shift = 0;
-        loop {
-            if idx >= buf.len() {
-                return None;
+        match decode_variable_int(buf, 1) {
+            Some((remaining_len, body_start)) => {
+                let total = body_start + remaining_len as usize;
+                (buf.len() >= total).then(|| buf.split_to(total).to_vec())
             }
-            let byte = buf[idx];
-            idx += 1;
-            remaining_len |= u32::from(byte & 0x7F) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 21 {
-                return Some(buf.split().to_vec());
-            }
+            None if buf.len() >= 5 => Some(buf.split().to_vec()),
+            None => None,
         }
-        let total = idx + remaining_len as usize;
-        if buf.len() < total {
-            return None;
-        }
-        Some(buf.split_to(total).to_vec())
     }
 
     async fn read_until(&mut self, deadline: tokio::time::Instant) -> ReadOutcome {
@@ -660,16 +393,6 @@ impl<T: Transport> RawMqttClient<T> {
                 Ok(Ok(n)) => self.buf.extend_from_slice(&tmp[..n]),
                 Err(_) => return ReadOutcome::TimedOut,
             }
-        }
-    }
-
-    pub async fn read_mqtt_packet(&mut self, timeout_dur: Duration) -> Option<Vec<u8>> {
-        match self
-            .read_until(tokio::time::Instant::now() + timeout_dur)
-            .await
-        {
-            ReadOutcome::Packet(pkt) => Some(pkt),
-            ReadOutcome::Closed | ReadOutcome::TimedOut => None,
         }
     }
 }
@@ -2008,24 +1731,7 @@ fn build_connect_with_will(client_id: &str, connect_flags: u8) -> Vec<u8> {
 }
 
 fn parse_ack_packet(data: &[u8]) -> Option<(u16, u8)> {
-    let mut idx = 1;
-    let mut remaining_len: u32 = 0;
-    let mut shift = 0;
-    loop {
-        if idx >= data.len() {
-            return None;
-        }
-        let byte = data[idx];
-        idx += 1;
-        remaining_len |= u32::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 21 {
-            return None;
-        }
-    }
+    let (remaining_len, idx) = decode_variable_int(data, 1)?;
     if data.len() < idx + remaining_len as usize || remaining_len < 2 {
         return None;
     }
@@ -2105,27 +1811,7 @@ pub fn wrap_fixed_header(first_byte: u8, body: &[u8]) -> Vec<u8> {
 }
 
 fn extract_auth_method_property(data: &[u8], props_start: usize) -> Option<String> {
-    let mut idx = props_start;
-    if idx >= data.len() {
-        return None;
-    }
-    let mut props_len: u32 = 0;
-    let mut shift = 0;
-    loop {
-        if idx >= data.len() {
-            return None;
-        }
-        let byte = data[idx];
-        idx += 1;
-        props_len |= u32::from(byte & 0x7F) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 21 {
-            return None;
-        }
-    }
+    let (props_len, mut idx) = decode_variable_int(data, props_start)?;
     let props_end = idx + props_len as usize;
     while idx < props_end && idx < data.len() {
         let prop_id = data[idx];
@@ -2269,6 +1955,18 @@ mod framing_tests {
             client.read_packet_bytes(TIMEOUT).await,
             Some(PUBLISH[..4].to_vec()),
             "a partial packet before the close must reach the caller, not look like silence"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_publish_packets_keeps_publishes_the_parser_rejects() {
+        let non_utf8_topic = [0x32, 0x07, 0x00, 0x01, 0xFF, 0x00, 0x03, 0x00, b'c'];
+        let (mut client, server) = client_receiving(&[&PUBLISH, &PUBACK, &non_utf8_topic]).await;
+        drop(server);
+        assert_eq!(
+            client.read_publish_packets(TIMEOUT).await,
+            [PUBLISH.to_vec(), non_utf8_topic.to_vec()],
+            "every PUBLISH must be counted, including one that does not parse"
         );
     }
 }
