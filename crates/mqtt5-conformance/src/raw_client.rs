@@ -6,7 +6,7 @@
 //! [`RawPacketBuilder`] constructs both valid and deliberately invalid MQTT
 //! v5.0 packets for conformance edge-case testing.
 
-use crate::packet_parser::{decode_variable_int, ParsedPublish};
+use crate::packet_parser::{decode_variable_int, ParsedProperties, ParsedPublish};
 use crate::transport::{TcpTransport, Transport};
 use bytes::{BufMut, BytesMut};
 use mqtt5_protocol::packet::connack::ConnAckPacket;
@@ -90,11 +90,13 @@ impl<T: Transport> RawMqttClient<T> {
         self.stream.write_all(data).await
     }
 
-    pub async fn read_packet_bytes(&mut self, timeout_dur: Duration) -> Option<Vec<u8>> {
-        match self
-            .read_until(tokio::time::Instant::now() + timeout_dur)
+    pub async fn read_packet(&mut self, timeout_dur: Duration) -> ReadOutcome {
+        self.read_until(tokio::time::Instant::now() + timeout_dur)
             .await
-        {
+    }
+
+    pub async fn read_packet_bytes(&mut self, timeout_dur: Duration) -> Option<Vec<u8>> {
+        match self.read_packet(timeout_dur).await {
             ReadOutcome::Packet(pkt) => Some(pkt),
             ReadOutcome::Closed | ReadOutcome::TimedOut => None,
         }
@@ -349,7 +351,9 @@ impl<T: Transport> RawMqttClient<T> {
         if data.len() < idx + remaining_len as usize {
             return None;
         }
-        Some((data[idx], extract_auth_method_property(&data, idx + 1)))
+        let (props_len, props_start) = decode_variable_int(&data, idx + 1)?;
+        let properties = ParsedProperties::parse(&data, props_start, props_len as usize)?;
+        Some((data[idx], properties.authentication_method))
     }
 
     pub async fn expect_disconnect(&mut self, timeout_dur: Duration) -> bool {
@@ -397,7 +401,7 @@ impl<T: Transport> RawMqttClient<T> {
     }
 }
 
-enum ReadOutcome {
+pub enum ReadOutcome {
     Packet(Vec<u8>),
     Closed,
     TimedOut,
@@ -1808,53 +1812,6 @@ pub fn wrap_fixed_header(first_byte: u8, body: &[u8]) -> Vec<u8> {
     encode_variable_int(&mut packet, body.len());
     packet.put_slice(body);
     packet.to_vec()
-}
-
-fn extract_auth_method_property(data: &[u8], props_start: usize) -> Option<String> {
-    let (props_len, mut idx) = decode_variable_int(data, props_start)?;
-    let props_end = idx + props_len as usize;
-    while idx < props_end && idx < data.len() {
-        let prop_id = data[idx];
-        idx += 1;
-        if prop_id == 0x15 {
-            if idx + 2 > data.len() {
-                return None;
-            }
-            let str_len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-            idx += 2;
-            if idx + str_len > data.len() {
-                return None;
-            }
-            return String::from_utf8(data[idx..idx + str_len].to_vec()).ok();
-        }
-        match prop_id {
-            0x1F | 0x26 => {
-                if idx + 2 > data.len() {
-                    return None;
-                }
-                let len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-                idx += 2 + len;
-                if prop_id == 0x26 {
-                    if idx + 2 > data.len() {
-                        return None;
-                    }
-                    let vlen = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-                    idx += 2 + vlen;
-                }
-            }
-            0x16 => {
-                if idx + 2 > data.len() {
-                    return None;
-                }
-                let len = u16::from_be_bytes([data[idx], data[idx + 1]]) as usize;
-                idx += 2 + len;
-            }
-            _ => {
-                return None;
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
