@@ -181,7 +181,7 @@ When `--report <path>` is provided, the CLI writes a JSON file with this structu
 | Field | Description |
 |-------|-------------|
 | `summary` | Aggregate pass/fail/ignore/filter counts from the test run |
-| `capabilities` | Snapshot of the SUT's declared capabilities; with `--client`, the client name and its `automatic_reconnect`, `offline_queue` and `enhanced_auth` capabilities |
+| `capabilities` | Snapshot of the SUT's declared capabilities; with `--client`, the client name and the client requirement strings it supports under `supported` |
 | `tests` | Per-test entries with conformance IDs, source location, and outcome |
 | `status` | `"passed"`, `"failed"`, `"skipped"` (requirement unmet) or `"not_run"` (filtered out) |
 | `failure` | The panic message of a failed test, or `null` |

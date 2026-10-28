@@ -21,6 +21,7 @@ const PROP_SUBSCRIPTION_IDENTIFIER: u8 = 0x0B;
 const PROP_SESSION_EXPIRY_INTERVAL: u8 = 0x11;
 const PROP_REASON_STRING: u8 = 0x1F;
 const PROP_AUTHENTICATION_METHOD: u8 = 0x15;
+const PROP_TOPIC_ALIAS_MAXIMUM: u8 = 0x22;
 const PROP_TOPIC_ALIAS: u8 = 0x23;
 const PROP_USER_PROPERTY: u8 = 0x26;
 const STRING_PROPERTIES: [u8; 4] = [
@@ -30,7 +31,7 @@ const STRING_PROPERTIES: [u8; 4] = [
     PROP_REASON_STRING,
 ];
 const BYTE_PROPERTIES: [u8; 7] = [0x17, 0x19, 0x24, 0x25, 0x28, 0x29, 0x2A];
-const TWO_BYTE_PROPERTIES: [u8; 3] = [0x13, 0x21, 0x22];
+const TWO_BYTE_PROPERTIES: [u8; 2] = [0x13, 0x21];
 const FOUR_BYTE_PROPERTIES: [u8; 2] = [0x18, 0x27];
 const LENGTH_PREFIXED_PROPERTIES: [u8; 4] = [0x12, 0x1A, 0x1C, 0x16];
 
@@ -89,6 +90,7 @@ pub struct ParsedProperties {
     pub user_properties: Vec<(String, String)>,
     pub subscription_identifiers: Vec<u32>,
     pub topic_alias: Option<u16>,
+    pub topic_alias_maximum: Option<u16>,
     pub content_type: Option<String>,
     pub response_topic: Option<String>,
     pub correlation_data: Option<Vec<u8>>,
@@ -166,11 +168,13 @@ impl ParsedProperties {
                     props.subscription_identifiers.push(val);
                     idx = next;
                 }
-                PROP_TOPIC_ALIAS => {
-                    if idx + 2 > end {
-                        return None;
+                PROP_TOPIC_ALIAS | PROP_TOPIC_ALIAS_MAXIMUM => {
+                    let value = u16::from_be_bytes(*data[..end].get(idx..idx + 2)?.first_chunk()?);
+                    if prop_id == PROP_TOPIC_ALIAS {
+                        props.topic_alias = Some(value);
+                    } else {
+                        props.topic_alias_maximum = Some(value);
                     }
-                    props.topic_alias = Some(u16::from_be_bytes([data[idx], data[idx + 1]]));
                     idx += 2;
                 }
                 PROP_USER_PROPERTY => {

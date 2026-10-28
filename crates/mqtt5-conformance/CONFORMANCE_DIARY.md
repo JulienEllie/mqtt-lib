@@ -42,6 +42,29 @@
 
 ## Diary Entries
 
+### Client SUT mode, phase 2: `conf_client_b.rs` (2026-10-28)
+
+**Trigger**: #166 part 2, second step. `conf_client_b.rs` held 35 client tests with their own fake broker.
+
+**Adapter changes**:
+- `ConnectSpec` takes Receive Maximum, Topic Alias Maximum, Maximum Packet Size, deferred acknowledgements and a reconnect delay range. `PublishSpec` takes Response Topic, Content Type and Subscription Identifiers.
+- `ClientUnderTest::subscribe` takes a QoS. `subscribe_deferred` holds the acknowledgements of messages on that filter, and `settle_deferred` sends them as accepted or rejected with a reason code. Both need the new `client.deferred_ack` requirement.
+- `ClientCapabilities` lists the supported requirements instead of one bool each. The CLI report puts them under `supported`.
+- `packet_parser` reads Topic Alias Maximum; `scripted_broker` builds PUBLISH first bytes and reads an acknowledgement's reason code.
+
+**Port**: 28 tests moved to `section3_publish`, `section3_qos_ack`, `section3_subscribe`, `section4_qos` and `section4_flow_control`, plus one each in `section3_connack` and `section3_connect`. They cite 36 statements; 10 had no test (5 NotApplicable, 5 Untested), so 189 of 251 are Tested.
+- Six tests stay in `conf_client_b.rs`: the prose rules with no numbered statement (zero-length topic needs an alias, Subscription Identifier 0 on SUBSCRIBE and inbound), deferred-ack redelivery at Receive Maximum after resume, the Topic Alias boundary check through the public API, and the 3.1.1 property check. Their messages no longer name IDs they do not test.
+- The unacknowledged-publish resend on resume was a duplicate of the phase 1 MQTT-4.4.0-1 test and is removed.
+- The PUBACK, PUBREC and PUBCOMP no-properties checks cited the Maximum Packet Size rules (MQTT-3.4.2-2 and its siblings) and are dropped.
+- Stale notes on MQTT-3.2.2-5, 3.3.2-9, 3.3.2-10 and 3.3.4-8 are removed. MQTT-3.3.4-7 held the text of 3.3.4-9; its note says so.
+
+**Controls**: 44 mutations of the mqtt5 client and codec, 49 test runs, each re-run against the final sources. Every target failed on the assertion tagged with the broken rule, and the 66 client tests passed after each revert. Found along the way:
+- Several rules are enforced twice. NUL in a string is refused by `check_publish` and by the encoder, a sent Topic Alias 0 by `check_publish` and by `check_topic_alias`, and an inbound alias 0 or above the maximum by the handler guard and by `register_alias`. A control had to break both places. With only the handler guard removed, the non-empty topic tests still pass because `register_alias` refuses the alias.
+- MQTT-3.3.4-7 has two paths: resent publishes in `replay_session_state` and queued ones in `flush_offline_queue`. Each test fails only under the mutation of its own path.
+- MQTT-3.3.4-8 has one mutation per assertion (SUBSCRIBE and DISCONNECT waiting for send quota).
+
+**Results**: conformance lib 317 passed (251 broker, 66 client), `manifest_load` 13 passed, integration files pass; `conf_client_b` 6 passed. CLI in-process 191 passed, 3 skipped; `--client mqtt5` 66 passed; external mqttv5 on 21883 191 passed, 3 skipped; Mosquitto on 21884 187 passed, 7 skipped. fmt and the four pedantic clippy runs are clean.
+
 ### Client SUT mode, phase 1 (2026-10-27)
 
 **Trigger**: #166 part 2. The client tests in `crates/mqtt5/tests/conf_client_*.rs` and `crates/mqtt5-wasm/tests/conformance_client.rs` each bring their own fake broker and are invisible to the manifest, so every Client statement was NotApplicable or Untested.

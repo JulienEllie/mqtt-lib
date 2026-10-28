@@ -102,7 +102,12 @@ The client test modules live in `src/client_conformance_tests/`:
 | `section1_data_repr` | 1.5 | UTF-8 strings and variable byte integers the client sends and receives |
 | `section2_packet_format` | 2 | Fixed header flags, packet identifiers, property length |
 | `section3_connect` | 3.1 | CONNECT encoding, keep alive, session resume, request problem information, enhanced auth |
-| `section3_connack` | 3.2 | How the client obeys the capabilities a CONNACK announces |
+| `section3_connack` | 3.2 | How the client obeys the capabilities a CONNACK announces, and Session Present 0 |
+| `section3_publish` | 3.3 | PUBLISH the client sends and inbound PUBLISH it must refuse or resolve |
+| `section3_qos_ack` | 3.4-3.7 | PUBACK, PUBREC and PUBCOMP the client sends |
+| `section3_subscribe` | 3.6, 3.8, 3.10 | SUBSCRIBE, UNSUBSCRIBE and PUBREL wire format, SUBACK matching |
+| `section4_qos` | 4.3 | QoS 1 and QoS 2 receiver rules, first transmission DUP |
+| `section4_flow_control` | 3.3.4, 4.9 | Receive Maximum and send quota |
 | `section4_error_handling` | 4.13 | Closing the connection after a malformed packet |
 
 `tests/` holds `manifest_load.rs`, which checks the manifest against the registry, and 8 files of plain tokio tests run by `cargo test`.
@@ -198,6 +203,7 @@ Client tests take their own requirement strings, checked against the client adap
 | `client.automatic_reconnect` | The client reconnects on its own after the connection drops |
 | `client.offline_queue` | The client queues publishes made while it is disconnected |
 | `client.enhanced_auth` | The client runs a scripted enhanced authentication exchange and can re-authenticate |
+| `client.deferred_ack` | The client can hold the acknowledgement of a delivered message until the test settles it |
 
 ## Conformance Profiles
 
@@ -229,7 +235,7 @@ Tests self-register at link time via `linkme::distributed_slice`. The `CONFORMAN
 
 ### Client SUT mode
 
-`--client mqtt5` runs only the client tests, against the in-process mqtt5 client; without it the CLI runs only the broker tests. A client is plugged in through two traits in `client_sut.rs`: `ClientSut` creates a client from a `ConnectSpec` and reports its `ClientCapabilities`, and `ClientUnderTest` exposes connect, publish, subscribe, unsubscribe, disconnect, re-authenticate, the connection state and the messages received. The tests drive the client through these calls and play the broker side with `ScriptedBroker`, which accepts the client's TCP connection and reads and writes raw packets.
+`--client mqtt5` runs only the client tests, against the in-process mqtt5 client; without it the CLI runs only the broker tests. A client is plugged in through two traits in `client_sut.rs`: `ClientSut` creates a client from a `ConnectSpec` and reports its `ClientCapabilities`, and `ClientUnderTest` exposes connect, publish, subscribe, a subscribe whose acknowledgements the test settles, unsubscribe, disconnect, re-authenticate, the connection state and the messages received. The tests drive the client through these calls and play the broker side with `ScriptedBroker`, which accepts the client's TCP connection and reads and writes raw packets.
 
 ### Capability Gating
 
@@ -255,4 +261,4 @@ Each `ConformanceTest` carries a `requires` array of `Requirement` values. Befor
 | `manifest.rs` | `ConformanceManifest` — TOML-based statement tracking, coverage statistics |
 | `report.rs` | `ConformanceReport` — text and JSON report generation |
 | `conformance_tests/` | 24 broker test modules organized by specification section |
-| `client_conformance_tests/` | 5 client test modules organized by specification section |
+| `client_conformance_tests/` | 9 client test modules organized by specification section |

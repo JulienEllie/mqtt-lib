@@ -1,13 +1,13 @@
 use super::common::{
-    begin, finish, parse_publish, queued_publish_then_reconnect, read_connect, reconnect_with,
-    start,
+    accept_next, begin, drop_connection, finish, parse_publish, queued_publish_then_reconnect,
+    read_connect, reconnect_with, start, subscribe_and_ack, wait_connected, TIMEOUT,
 };
 use crate::client_conformance_test;
-use crate::client_sut::{ClientSutHandle, ClientUnderTest, ConnectSpec, PublishSpec};
+use crate::client_sut::{ClientSutHandle, ClientUnderTest, ConnectSpec, PublishSpec, Settle};
 use crate::scripted_broker::{
-    property_u16, property_u32, property_u8, publish, BrokerConnection, PROP_MAXIMUM_PACKET_SIZE,
-    PROP_MAXIMUM_QOS, PROP_RETAIN_AVAILABLE, PROP_TOPIC_ALIAS_MAXIMUM, PUBACK, PUBLISH, PUBREC,
-    SUBSCRIBE, UNSUBSCRIBE,
+    property_u16, property_u32, property_u8, publish, publish_first_byte, subscription_ack,
+    BrokerConnection, PROP_MAXIMUM_PACKET_SIZE, PROP_MAXIMUM_QOS, PROP_RETAIN_AVAILABLE,
+    PROP_TOPIC_ALIAS_MAXIMUM, PUBACK, PUBLISH, PUBREC, SUBSCRIBE, UNSUBSCRIBE,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -181,7 +181,7 @@ async fn retain_available_applies_to_messages_queued_while_offline(sut: ClientSu
     let spec = PublishSpec {
         qos: 1,
         retain: true,
-        topic_alias: None,
+        ..PublishSpec::default()
     };
     let sent = queued_publish_then_reconnect(
         &sut,
@@ -281,7 +281,7 @@ async fn assert_request_fits(sut: &ClientSutHandle, unsubscribe: bool) {
     let request = if unsubscribe {
         s.client.unsubscribe(&filter)
     } else {
-        s.client.subscribe(&filter)
+        s.client.subscribe(&filter, 0)
     };
     let requesting = tokio::spawn(request);
     let sent = s
@@ -349,4 +349,82 @@ async fn topic_alias_maximum_not_stale_after_reconnect(sut: ClientSutHandle) {
     )
     .await;
     assert_no_alias_sent(&client, &mut conn, 1, "MQTT-3.2.2-18").await;
+}
+
+/// [MQTT-3.2.2-5] A Client that holds Session State and gets Session Present
+/// 0 discards it, so acknowledgements left over from the old session are not
+/// sent on the new connection.
+#[client_conformance_test(
+    ids = ["MQTT-3.2.2-5"],
+    requires = ["client.automatic_reconnect", "client.deferred_ack"],
+)]
+async fn queued_acks_discarded_when_session_not_present(sut: ClientSutHandle) {
+    let spec = ConnectSpec::new("sp0-acks")
+        .resuming(300)
+        .with_receive_maximum(4)
+        .with_deferred_ack()
+        .reconnecting_after(Duration::from_millis(100), Duration::from_millis(200));
+    let mut s = start(&sut, spec, false, &[]).await;
+    s.result.as_ref().unwrap();
+    let subscribing = tokio::spawn(s.client.subscribe_deferred("t/deferred", 1));
+    let subscribe = s.conn.next_of_type(SUBSCRIBE, TIMEOUT).await.unwrap();
+    s.conn
+        .send(&subscription_ack(
+            0x90,
+            subscribe.leading_packet_id().unwrap(),
+            &[],
+            &[0x01],
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, subscribing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    subscribe_and_ack(&mut s, "t/auto", 1).await;
+
+    s.conn
+        .send(&publish(
+            publish_first_byte(1, false),
+            b"t/deferred",
+            Some(1),
+            &[],
+            b"held",
+        ))
+        .await
+        .unwrap();
+    s.conn
+        .send(&publish(
+            publish_first_byte(1, false),
+            b"t/auto",
+            Some(2),
+            &[],
+            b"auto",
+        ))
+        .await
+        .unwrap();
+    let before = s
+        .conn
+        .next_of_type(PUBACK, Duration::from_millis(400))
+        .await;
+    assert!(
+        before.is_none(),
+        "setup: the PUBACK for id 2 waits behind the unresolved token for id 1"
+    );
+    let (client, broker) = drop_connection(s).await;
+
+    let (mut conn, _) = accept_next(&broker, false, &[]).await;
+    wait_connected(&client, true).await;
+    assert_eq!(
+        client.settle_deferred(Settle::Ack),
+        1,
+        "setup: one delivery holds a token"
+    );
+    let puback = conn.next_of_type(PUBACK, Duration::from_millis(800)).await;
+    assert!(
+        puback.is_none(),
+        "[MQTT-3.2.2-5] an acknowledgement from the discarded session was sent on a Session Present=0 connection: packet id {:?}",
+        puback.and_then(|p| p.leading_packet_id())
+    );
 }

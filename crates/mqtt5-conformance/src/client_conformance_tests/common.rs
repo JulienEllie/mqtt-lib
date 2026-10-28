@@ -1,16 +1,18 @@
 use crate::client_sut::{
-    ClientError, ClientSutHandle, ClientUnderTest, ConnectOutcome, ConnectSpec, PublishSpec,
+    ClientError, ClientSutHandle, ClientUnderTest, ConnectOutcome, ConnectSpec, PublishOutcome,
+    PublishSpec, ReceivedMessage,
 };
 use crate::packet_parser::ParsedPublish;
 use crate::scripted_broker::{
-    connack, subscription_ack, BrokerConnection, CloseObservation, Next, Packet, ScriptedBroker,
-    CONNECT, PUBLISH, SUBSCRIBE,
+    connack, property_u16, subscription_ack, BrokerConnection, CloseObservation, Next, Packet,
+    ScriptedBroker, CONNECT, PROP_RECEIVE_MAXIMUM, PUBLISH, SUBSCRIBE,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
 pub const TIMEOUT: Duration = Duration::from_secs(5);
+pub const SHORT: Duration = Duration::from_millis(600);
 
 pub type ConnectResult = Result<ConnectOutcome, ClientError>;
 
@@ -177,12 +179,43 @@ pub async fn queued_publish_then_reconnect(
     })
 }
 
+pub async fn publishes_until_quiet(conn: &mut BrokerConnection, wait: Duration) -> Vec<Packet> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut publishes = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match conn.next_answering_pings(left).await {
+            Next::Packet(packet) if packet.packet_type() == PUBLISH => publishes.push(packet),
+            Next::Packet(_) => {}
+            Next::Malformed | Next::Closed | Next::Silent => return publishes,
+        }
+    }
+}
+
+pub async fn queued_flush(sut: &ClientSutHandle, client_id: &str) -> Vec<Packet> {
+    let spec = ConnectSpec::new(client_id)
+        .resuming(300)
+        .reconnecting_after(Duration::from_millis(1500), Duration::from_millis(2000));
+    let session = start(sut, spec, false, &[]).await;
+    session.result.as_ref().expect("first connect");
+    let (client, broker) = drop_connection(session).await;
+    for i in 0..3u8 {
+        let queued = client.publish("t/queued", &[i], PublishSpec::qos(1)).await;
+        assert!(
+            matches!(queued, Ok(PublishOutcome::Pending)),
+            "publish while disconnected is queued: {queued:?}"
+        );
+    }
+    let (mut conn, _) = accept_next(&broker, true, &property_u16(PROP_RECEIVE_MAXIMUM, 1)).await;
+    publishes_until_quiet(&mut conn, Duration::from_millis(1500)).await
+}
+
 pub fn parse_publish(packet: &Packet) -> ParsedPublish {
     ParsedPublish::parse(packet.bytes()).expect("client sent a malformed PUBLISH")
 }
 
-pub async fn subscribe_and_ack(session: &mut Session, filter: &str) {
-    let subscribing = tokio::spawn(session.client.subscribe(filter));
+pub async fn subscribe_and_ack(session: &mut Session, filter: &str, qos: u8) {
+    let subscribing = tokio::spawn(session.client.subscribe(filter, qos));
     let subscribe = session
         .conn
         .next_of_type(SUBSCRIBE, TIMEOUT)
@@ -193,7 +226,7 @@ pub async fn subscribe_and_ack(session: &mut Session, filter: &str) {
         .expect("SUBSCRIBE without a packet identifier");
     session
         .conn
-        .send(&subscription_ack(0x90, packet_id, &[], &[0x00]))
+        .send(&subscription_ack(0x90, packet_id, &[], &[qos]))
         .await
         .expect("send SUBACK");
     tokio::time::timeout(TIMEOUT, subscribing)
@@ -201,6 +234,14 @@ pub async fn subscribe_and_ack(session: &mut Session, filter: &str) {
         .expect("subscribe did not complete")
         .expect("subscribe task panicked")
         .expect("subscribe failed");
+}
+
+pub async fn received_after(
+    client: &Arc<dyn ClientUnderTest>,
+    wait: Duration,
+) -> Vec<ReceivedMessage> {
+    tokio::time::sleep(wait).await;
+    client.received()
 }
 
 pub struct MalformedOutcome {
@@ -216,7 +257,7 @@ pub async fn inject_after_subscribe(
 ) -> MalformedOutcome {
     let mut session = start(sut, ConnectSpec::new(client_id), false, &[]).await;
     session.result.as_ref().expect("connect");
-    subscribe_and_ack(&mut session, "#").await;
+    subscribe_and_ack(&mut session, "#", 0).await;
     session.conn.send(bytes).await.expect("send packet");
     let close = session.conn.observe_close(Duration::from_secs(3)).await;
     MalformedOutcome {
