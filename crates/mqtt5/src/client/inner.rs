@@ -353,25 +353,58 @@ impl MqttClient {
 
     /// The WebSocket configuration for a connection to `url`: the one set with
     /// `ConnectOptions::with_websocket_config`, read on every attempt so
-    /// reconnects use it too, or a default one, which a server redirect
-    /// always gets.
+    /// reconnects use it too, or a default one. A server redirect gets a
+    /// default one with that configuration's TLS configuration.
     #[cfg(feature = "transport-websocket")]
     async fn websocket_config_for(
         &self,
         url: &str,
         settings: WebSocketSettings,
     ) -> Result<WebSocketConfig> {
-        let configured = match settings {
-            WebSocketSettings::Configured => {
-                self.inner.read().await.options.websocket_config.clone()
+        let configured = self.inner.read().await.options.websocket_config.clone();
+        match (configured, settings) {
+            (Some(config), WebSocketSettings::Configured) => {
+                WebSocketConfig::clone(&config).with_url(url)
             }
-            WebSocketSettings::Default => None,
-        };
-        match configured {
-            Some(config) => WebSocketConfig::clone(&config).with_url(url),
-            None => WebSocketConfig::new(url),
+            (Some(config), WebSocketSettings::Redirected) => {
+                WebSocketConfig::new(url).map(|redirected| match config.tls_config.clone() {
+                    Some(tls_config) => redirected.with_tls_config(tls_config),
+                    None => redirected,
+                })
+            }
+            (None, _) => WebSocketConfig::new(url),
         }
         .map_err(|e| MqttError::ConnectionError(format!("Invalid WebSocket URL: {e}")))
+    }
+
+    /// Refuses a redirect from a wss:// connection whose WebSocket
+    /// configuration has a TLS configuration of its own to anything but
+    /// wss://, which is all that TLS configuration goes with
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the redirect is refused
+    #[cfg(feature = "transport-websocket")]
+    async fn check_redirect_keeps_websocket_tls(&self, from: &str, to: &str) -> Result<()> {
+        let (from_transport, _, _) = Self::parse_address(from)?;
+        let (to_transport, _, _) = Self::parse_address(to)?;
+        let own_tls = self
+            .inner
+            .read()
+            .await
+            .options
+            .websocket_config
+            .as_ref()
+            .is_some_and(|config| config.tls_config.is_some());
+        if own_tls
+            && matches!(from_transport, ClientTransportType::WebSocketSecure(..))
+            && !matches!(to_transport, ClientTransportType::WebSocketSecure(..))
+        {
+            return Err(MqttError::ConnectionError(format!(
+                "Server redirect to {to} refused: the WebSocket configuration's TLS configuration is for wss:// alone"
+            )));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "transport-websocket")]
@@ -701,7 +734,14 @@ impl MqttClient {
                                 "Following server redirect"
                             );
                             redirect_count += 1;
-                            current_address = Self::redirect_address(&current_address, &url)?;
+                            let next_address = Self::redirect_address(&current_address, &url)?;
+                            #[cfg(feature = "transport-websocket")]
+                            self.check_redirect_keeps_websocket_tls(
+                                &current_address,
+                                &next_address,
+                            )
+                            .await?;
+                            current_address = next_address;
                             continue;
                         }
                     }

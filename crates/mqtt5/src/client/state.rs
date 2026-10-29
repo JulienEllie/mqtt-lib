@@ -16,8 +16,11 @@ use crate::transport::tls::TlsConfig;
 #[cfg(feature = "transport-websocket")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WebSocketSettings {
+    /// The configuration set with `ConnectOptions::with_websocket_config`
     Configured,
-    Default,
+    /// Its TLS configuration alone, for a server redirect: its headers and
+    /// request modifier go only to the address passed to `connect`
+    Redirected,
 }
 
 /// What an automatic reconnection connects to
@@ -56,9 +59,11 @@ impl ClientTransportType {
     pub(crate) fn redirected(self) -> Self {
         match self {
             #[cfg(feature = "transport-websocket")]
-            Self::WebSocket(url, _) => Self::WebSocket(url, WebSocketSettings::Default),
+            Self::WebSocket(url, _) => Self::WebSocket(url, WebSocketSettings::Redirected),
             #[cfg(feature = "transport-websocket")]
-            Self::WebSocketSecure(url, _) => Self::WebSocketSecure(url, WebSocketSettings::Default),
+            Self::WebSocketSecure(url, _) => {
+                Self::WebSocketSecure(url, WebSocketSettings::Redirected)
+            }
             other => other,
         }
     }

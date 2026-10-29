@@ -401,3 +401,89 @@ async fn connect_with_tls_is_redirected_only_over_tls() {
     );
     handle.abort();
 }
+
+/// A broker taking MQTT over WebSocket over TLS, at `wss://localhost:<port>/mqtt`,
+/// that redirects every client to `backend` if there is one
+#[cfg(feature = "transport-websocket")]
+async fn wss_broker(backend: Option<String>) -> (u16, tokio::task::JoinHandle<()>) {
+    use mqtt5::broker::config::{TlsConfig as BrokerTlsConfig, WebSocketConfig};
+    use mqtt5::broker::MqttBroker;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certs = common::find_workspace_root().join("test_certs");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let config = match backend {
+        Some(backend) => lb_config(vec![backend]),
+        None => backend_config(),
+    }
+    .with_tls(
+        BrokerTlsConfig::new(certs.join("server.pem"), certs.join("server.key"))
+            .with_require_client_cert(false)
+            .with_bind_address("127.0.0.1:0".parse::<SocketAddr>().unwrap()),
+    )
+    .with_websocket_tls(
+        WebSocketConfig::new()
+            .with_bind_addresses(vec![format!("127.0.0.1:{port}").parse().unwrap()])
+            .with_path("/mqtt".to_string()),
+    );
+    let mut broker = MqttBroker::with_config(config).await.unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = broker.run().await;
+    });
+    (port, handle)
+}
+
+/// Options whose WebSocket configuration trusts the test CA alone
+#[cfg(feature = "transport-websocket")]
+fn trusting_the_test_ca(client_id: &str, url: &str) -> mqtt5::ConnectOptions {
+    let mut tls =
+        mqtt5::transport::tls::TlsConfig::new("127.0.0.1:0".parse().unwrap(), "localhost")
+            .with_system_roots(false);
+    tls.load_ca_cert_pem_bytes(&common::test_ca()).unwrap();
+    mqtt5::ConnectOptions::new(client_id).with_websocket_config(
+        mqtt5::transport::websocket::WebSocketConfig::new(url)
+            .unwrap()
+            .with_tls_config(tls),
+    )
+}
+
+#[cfg(feature = "transport-websocket")]
+#[tokio::test]
+async fn a_wss_redirect_keeps_the_websocket_configurations_tls() {
+    let (backend, backend_handle) = wss_broker(None).await;
+    let (balancer, handle) = wss_broker(Some(format!("wss://localhost:{backend}/mqtt"))).await;
+    let direct = format!("wss://localhost:{backend}/mqtt");
+    let client = MqttClient::with_options(trusting_the_test_ca("wss-redirect-keeps-tls", &direct));
+    client.connect(&direct).await.expect("trusting the test CA");
+    client.disconnect().await.unwrap();
+    let url = format!("wss://localhost:{balancer}/mqtt");
+    client
+        .connect(&url)
+        .await
+        .expect("redirected to the backend, trusting the test CA");
+    client.disconnect().await.unwrap();
+    handle.abort();
+    backend_handle.abort();
+}
+
+#[cfg(feature = "transport-websocket")]
+#[tokio::test]
+async fn a_wss_redirect_with_its_own_tls_is_refused_to_another_transport() {
+    let backend = TestBroker::start_with_tls().await;
+    let (balancer, handle) = wss_broker(Some(backend.address().to_string())).await;
+    let url = format!("wss://localhost:{balancer}/mqtt");
+    let client = MqttClient::with_options(trusting_the_test_ca("wss-redirect-to-mqtts", &url));
+    let error = client
+        .connect(&url)
+        .await
+        .expect_err("the WebSocket configuration's TLS is for wss:// alone");
+    assert!(
+        error.to_string().contains("WebSocket configuration"),
+        "refused for that reason: {error}"
+    );
+    handle.abort();
+}
