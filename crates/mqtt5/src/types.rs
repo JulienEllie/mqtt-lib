@@ -76,7 +76,9 @@ impl ConnectOptions {
     /// into each upgrade request, and for wss:// its TLS configuration, when it
     /// has one, is used in place of the one stored with `set_tls_config` or
     /// `connect_with_tls` (`set_insecure_tls(true)` still disables
-    /// verification). The client connects to the address passed to `connect`,
+    /// verification, and a verifier set with
+    /// `MqttClient::set_server_cert_verifier` replaces its own, unless it has
+    /// verification disabled). The client connects to the address passed to `connect`,
     /// so the configuration's own `url` is not used; build it from that
     /// address or any URL with the same scheme. A connection that follows a
     /// server redirect (`UseAnotherServer` or `ServerMoved`) uses its TLS

@@ -23,17 +23,36 @@ use super::direct::{AutomaticReconnectLifecycle, StoredSubscription};
 use super::state::WebSocketSettings;
 use super::state::{ClientTransportType, Reconnection};
 use super::MqttClient;
+#[cfg(feature = "transport-quic")]
+use std::sync::Arc;
 
 /// The TLS settings a QUIC connection's configuration was built from: the
 /// configuration kept for early data is used again only with the same ones,
 /// so that a quics:// connection is never made with one built for quic://,
-/// for insecure TLS or for another stored TLS configuration
+/// for insecure TLS, for another stored TLS configuration or for another
+/// verifier
 #[cfg(feature = "transport-quic")]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct QuicBuiltFor {
     secure: bool,
     insecure_tls: bool,
     tls_config_times_stored: u64,
+    server_cert_verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+}
+
+#[cfg(feature = "transport-quic")]
+impl PartialEq for QuicBuiltFor {
+    fn eq(&self, other: &Self) -> bool {
+        let same_verifier = match (&self.server_cert_verifier, &other.server_cert_verifier) {
+            (Some(one), Some(other)) => Arc::ptr_eq(one, other),
+            (None, None) => true,
+            _ => false,
+        };
+        self.secure == other.secure
+            && self.insecure_tls == other.insecure_tls
+            && self.tls_config_times_stored == other.tls_config_times_stored
+            && same_verifier
+    }
 }
 
 /// A connected transport, with what its configuration was built from if it is
@@ -351,11 +370,11 @@ impl MqttClient {
     }
 
     /// The configuration of an mqtts:// connection to `addr`: the stored TLS
-    /// configuration, or a default one
+    /// configuration, or a default one, with the client's verifier
     async fn tls_config_for(&self, addr: std::net::SocketAddr, host: &str) -> TlsConfig {
         let insecure = self.transport_config.read().await.insecure_tls;
         let tls_config_lock = self.tls_config.read().await;
-        if let Some(existing_config) = &tls_config_lock.config {
+        let mut config = if let Some(existing_config) = &tls_config_lock.config {
             tracing::debug!(
                 "Using stored TLS config - use_system_roots: {}, has_ca: {}, has_cert: {}",
                 existing_config.use_system_roots,
@@ -370,7 +389,12 @@ impl MqttClient {
         } else {
             tracing::debug!("No stored TLS config, using default");
             TlsConfig::new(addr, server_name(host)).with_verify_server_cert(!insecure)
+        };
+        drop(tls_config_lock);
+        if let Some(verifier) = self.server_cert_verifier.read().await.clone() {
+            config = config.with_server_cert_verifier(verifier);
         }
+        config
     }
 
     async fn open_tls(config: TlsConfig) -> Result<TransportType> {
@@ -457,11 +481,15 @@ impl MqttClient {
         settings: WebSocketSettings,
     ) -> Result<TransportType> {
         let insecure = self.transport_config.read().await.insecure_tls;
+        let verifier = self.server_cert_verifier.read().await.clone();
         let mut config = self.websocket_config_for(url, settings).await?;
 
         if let Some(tls_config) = config.tls_config.as_mut() {
             if insecure {
                 tls_config.verify_server_cert = false;
+            }
+            if verifier.is_some() {
+                tls_config.server_cert_verifier = verifier;
             }
             return Self::open_websocket(config).await;
         }
@@ -476,15 +504,20 @@ impl MqttClient {
         let tls_config = match stored {
             Some(mut cfg) => {
                 cfg.addr = addr;
-                cfg.hostname = host.to_string();
+                cfg.hostname = server_name(host).to_string();
                 cfg.verify_server_cert = !insecure;
                 cfg.alpn_protocols = None;
                 Some(cfg)
             }
-            None if insecure => Some(TlsConfig::new(addr, host).with_verify_server_cert(false)),
+            None if insecure || verifier.is_some() => {
+                Some(TlsConfig::new(addr, server_name(host)).with_verify_server_cert(!insecure))
+            }
             None => None,
         };
-        if let Some(tls_config) = tls_config {
+        if let Some(mut tls_config) = tls_config {
+            if let Some(verifier) = verifier {
+                tls_config = tls_config.with_server_cert_verifier(verifier);
+            }
             config = config.with_tls_config(tls_config);
         }
 
@@ -516,6 +549,7 @@ impl MqttClient {
             secure: false,
             insecure_tls: true,
             tls_config_times_stored: 0,
+            server_cert_verifier: None,
         };
         let qc = self.transport_config.read().await;
         let mut config = QuicConfig::new(addr, server_name(host))
@@ -563,8 +597,9 @@ impl MqttClient {
     }
 
     /// The configuration of a quics:// connection to `addr`, and what it was
-    /// built from: the client's transport settings and a stored TLS
-    /// configuration's certificates, each read once
+    /// built from: the client's transport settings, a stored TLS
+    /// configuration's certificates and verifier, and the client's verifier,
+    /// each read once
     #[cfg(feature = "transport-quic")]
     async fn quic_secure_config(
         &self,
@@ -611,15 +646,26 @@ impl MqttClient {
             // roots are trusted alone. One with none takes the system roots
             // away if it leaves them out itself.
             config.use_system_roots &= existing_config.use_system_roots;
+
+            if let Some(ref verifier) = existing_config.server_cert_verifier {
+                config = config.with_server_cert_verifier(verifier.clone());
+            }
         } else {
             tracing::debug!("No stored TLS config for QUIC, using default");
         }
+        let tls_config_times_stored = tls_config_lock.times_stored;
+        drop(tls_config_lock);
+        let server_cert_verifier = self.server_cert_verifier.read().await.clone();
+        if let Some(ref verifier) = server_cert_verifier {
+            config = config.with_server_cert_verifier(verifier.clone());
+        }
+
         let built_for = QuicBuiltFor {
             secure: true,
             insecure_tls: qc.insecure_tls,
-            tls_config_times_stored: tls_config_lock.times_stored,
+            tls_config_times_stored,
+            server_cert_verifier,
         };
-        drop(tls_config_lock);
 
         if qc.enable_early_data {
             if let Some(cached) = self.kept_quic_client_config(&built_for).await {
@@ -1116,5 +1162,190 @@ mod tests {
                 .use_system_roots,
             "a stored TLS configuration without system roots has none over QUIC either"
         );
+    }
+
+    #[cfg(all(feature = "transport-quic", feature = "broker"))]
+    mod early_data {
+        use super::*;
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use rustls::client::WebPkiServerVerifier;
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{CertificateError, DigitallySignedStruct, Error, SignatureScheme};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// Checks the server's certificate against the test CA, or refuses
+        /// it, counting its calls; and on its first call sets the verifier
+        /// of the client it was given to the one it was given.
+        struct TestVerifier {
+            checks: Arc<WebPkiServerVerifier>,
+            refuses: bool,
+            calls: AtomicUsize,
+            then: Mutex<Option<(MqttClient, Arc<dyn ServerCertVerifier>)>>,
+        }
+
+        impl std::fmt::Debug for TestVerifier {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("TestVerifier")
+            }
+        }
+
+        impl TestVerifier {
+            fn new(refuses: bool) -> Arc<Self> {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let mut roots = rustls::RootCertStore::empty();
+                roots
+                    .add(
+                        CertificateDer::from_pem_file(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/../../test_certs/ca.pem"
+                        ))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                Arc::new(Self {
+                    checks: WebPkiServerVerifier::builder(Arc::new(roots))
+                        .build()
+                        .unwrap(),
+                    refuses,
+                    calls: AtomicUsize::new(0),
+                    then: Mutex::new(None),
+                })
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl ServerCertVerifier for TestVerifier {
+            fn verify_server_cert(
+                &self,
+                end_entity: &CertificateDer<'_>,
+                intermediates: &[CertificateDer<'_>],
+                server_name: &ServerName<'_>,
+                ocsp_response: &[u8],
+                now: UnixTime,
+            ) -> Result<ServerCertVerified, Error> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let then = self.then.lock().unwrap().take();
+                if let Some((client, verifier)) = then {
+                    // From a thread of its own, waited for: this is called
+                    // inside the handshake. It would deadlock were the
+                    // client's verifier lock held through a handshake.
+                    std::thread::spawn(move || {
+                        tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap()
+                            .block_on(client.set_server_cert_verifier(Some(verifier)));
+                    })
+                    .join()
+                    .unwrap();
+                }
+                if self.refuses {
+                    return Err(Error::InvalidCertificate(
+                        CertificateError::ApplicationVerificationFailure,
+                    ));
+                }
+                self.checks.verify_server_cert(
+                    end_entity,
+                    intermediates,
+                    server_name,
+                    ocsp_response,
+                    now,
+                )
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                self.checks.verify_tls12_signature(message, cert, dss)
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, Error> {
+                self.checks.verify_tls13_signature(message, cert, dss)
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                self.checks.supported_verify_schemes()
+            }
+        }
+
+        async fn quic_broker_with_early_data() -> (tokio::task::JoinHandle<()>, std::net::SocketAddr)
+        {
+            use crate::broker::config::{
+                BrokerConfig, QuicConfig as BrokerQuicConfig, StorageBackend, StorageConfig,
+            };
+            let certs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_certs");
+            let config = BrokerConfig::default()
+                .with_storage(StorageConfig::default().with_backend(StorageBackend::Memory))
+                .with_bind_address(([127, 0, 0, 1], 0))
+                .with_quic(
+                    BrokerQuicConfig::new(certs.join("server.pem"), certs.join("server.key"))
+                        .with_bind_address(([127, 0, 0, 1], 0))
+                        .with_early_data(true),
+                );
+            let mut broker = crate::broker::MqttBroker::with_config(config)
+                .await
+                .unwrap();
+            let addr = broker.quic_local_addr().unwrap();
+            (
+                tokio::spawn(async move {
+                    let _ = broker.run().await;
+                }),
+                addr,
+            )
+        }
+
+        /// A verifier changed and changed back while a quics:// connection
+        /// is made: the configuration kept for early data is the one built
+        /// with the verifier in between, and is not used again with the first.
+        #[tokio::test]
+        async fn kept_for_the_verifier_it_was_built_with() {
+            let (broker, addr) = quic_broker_with_early_data().await;
+            let client = MqttClient::new("early-data-built-with");
+            client.set_quic_early_data(true).await;
+            let refusing = TestVerifier::new(true);
+            client
+                .set_server_cert_verifier(Some(refusing.clone()))
+                .await;
+            // Held while the connection reads the stored TLS configuration,
+            // after the settings it starts with and before the verifier it
+            // is built with.
+            let url = format!("quics://{addr}");
+            let held = client.tls_config.write().await;
+            let mut connecting = Box::pin(client.connect(&url));
+            assert!(connecting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+            let between = TestVerifier::new(false);
+            *between.then.lock().unwrap() = Some((client.clone(), refusing.clone()));
+            client.set_server_cert_verifier(Some(between.clone())).await;
+            drop(held);
+            connecting
+                .await
+                .expect("accepted by the verifier set while it was held");
+            assert!(between.calls() > 0);
+            client.disconnect().await.unwrap();
+            let refused_before = refusing.calls();
+            client
+                .connect(&url)
+                .await
+                .expect_err("refused by the verifier set back during the first connection");
+            assert!(refusing.calls() > refused_before);
+            broker.abort();
+        }
     }
 }

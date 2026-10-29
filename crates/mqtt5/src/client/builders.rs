@@ -60,6 +60,7 @@ impl MqttClient {
             connection_mutex: Arc::new(tokio::sync::Mutex::new(())),
             monitor_wakeup: Arc::new(tokio::sync::Notify::new()),
             tls_config: Arc::new(RwLock::new(super::StoredTlsConfig::default())),
+            server_cert_verifier: Arc::new(RwLock::new(None)),
             transport_config: Arc::new(RwLock::new(
                 crate::transport::ClientTransportConfig::default(),
             )),
@@ -94,6 +95,42 @@ impl MqttClient {
         self.transport_config.write().await.insecure_tls = insecure;
     }
 
+    /// Sets the verifier of the server certificate for connections made from
+    /// a URL (mqtts://, wss:// and quics://), reconnections and redirects
+    /// included, or `None` to go back to a stored TLS configuration's
+    /// verifier or root certificates, and with none stored, to the default
+    /// root certificates (the bundled ones for mqtts:// and quics://, the
+    /// system's for wss://)
+    ///
+    /// It replaces the root certificates, the verifier of a stored TLS
+    /// configuration, and that of the TLS configuration of
+    /// [`ConnectOptions::with_websocket_config`](crate::ConnectOptions::with_websocket_config):
+    /// see [`TlsConfig::with_server_cert_verifier`]. It is a rustls 0.23
+    /// `ServerCertVerifier`. A connection made with
+    /// [`connect_with_tls`](Self::connect_with_tls) does not use it: it uses
+    /// the configuration it is given, and so do its reconnections and the
+    /// redirects it follows.
+    ///
+    /// Insecure TLS ([`set_insecure_tls`](Self::set_insecure_tls)) still
+    /// disables verification, the verifier included, and so does a WebSocket
+    /// configuration's TLS configuration that has verification disabled. A
+    /// stored TLS configuration's own `with_verify_server_cert(false)` does
+    /// not: for connections made from a URL, insecure TLS alone decides.
+    ///
+    /// With early data ([`set_quic_early_data`](Self::set_quic_early_data)),
+    /// the QUIC configuration kept is used again only with the verifier it
+    /// was built with, and a quics:// connection that resumes a TLS session
+    /// made with it does not call the verifier again: rustls verified the
+    /// server's certificate when the session was made. A verifier that
+    /// should check every connection again is set again (a new `Arc`), or
+    /// early data left off.
+    pub async fn set_server_cert_verifier(
+        &self,
+        verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+    ) {
+        *self.server_cert_verifier.write().await = verifier;
+    }
+
     pub async fn set_quic_stream_strategy(&self, strategy: crate::transport::StreamStrategy) {
         self.transport_config.write().await.stream_strategy = strategy;
     }
@@ -122,9 +159,10 @@ impl MqttClient {
     ///
     /// The QUIC configuration of a connection is then kept and used again,
     /// with the TLS sessions it resumes, while the TLS settings it was built
-    /// from stay the same: quics:// or quic://, insecure TLS and the stored
-    /// TLS configuration. The QUIC settings it was built with (flow headers,
-    /// the stream limit, datagrams) stay with it until one of those changes.
+    /// from stay the same: quics:// or quic://, insecure TLS, the stored TLS
+    /// configuration and the client's verifier. The QUIC settings it was
+    /// built with (flow headers, the stream limit, datagrams) stay with it
+    /// until one of those changes.
     pub async fn set_quic_early_data(&self, enable: bool) {
         self.transport_config.write().await.enable_early_data = enable;
     }

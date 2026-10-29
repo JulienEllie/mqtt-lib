@@ -8,6 +8,7 @@ use crate::Transport;
 use bytes::{BufMut, BytesMut};
 use mqtt5_protocol::packet::{FixedHeader, Packet, PacketType};
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream};
+use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use std::net::SocketAddr;
@@ -28,6 +29,7 @@ pub struct QuicConfig {
     pub root_certs: Option<Vec<CertificateDer<'static>>>,
     pub use_system_roots: bool,
     pub verify_server_cert: bool,
+    pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
     pub stream_strategy: StreamStrategy,
     pub max_concurrent_streams: Option<usize>,
     pub enable_datagrams: bool,
@@ -55,6 +57,7 @@ impl QuicConfig {
             root_certs: None,
             use_system_roots: true,
             verify_server_cert: true,
+            server_cert_verifier: None,
             stream_strategy: StreamStrategy::default(),
             max_concurrent_streams: None,
             enable_datagrams: false,
@@ -95,6 +98,23 @@ impl QuicConfig {
     #[must_use]
     pub fn with_verify_server_cert(mut self, verify: bool) -> Self {
         self.verify_server_cert = verify;
+        self
+    }
+
+    /// Sets the verifier of the server certificate
+    ///
+    /// It replaces the root certificates, custom and system ones, as
+    /// [`TlsConfig::with_server_cert_verifier`](crate::transport::tls::TlsConfig::with_server_cert_verifier)
+    /// does. Disabling verification with
+    /// [`with_verify_server_cert`](Self::with_verify_server_cert) still
+    /// disables it, the verifier included. A cached client configuration
+    /// ([`with_cached_client_config`](Self::with_cached_client_config)) is
+    /// used in place of every TLS setting, this one included, and a
+    /// connection that resumes one of its TLS sessions does not call its
+    /// verifier again.
+    #[must_use]
+    pub fn with_server_cert_verifier(mut self, verifier: Arc<dyn ServerCertVerifier>) -> Self {
+        self.server_cert_verifier = Some(verifier);
         self
     }
 
@@ -156,7 +176,21 @@ impl QuicConfig {
     fn build_client_config(&self) -> Result<ClientConfig> {
         let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
 
-        let mut crypto = if self.verify_server_cert {
+        let builder = RustlsClientConfig::builder_with_provider(crypto_provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| {
+                MqttError::ConnectionError(format!("Failed to set protocol versions: {e}"))
+            })?;
+
+        let builder = if !self.verify_server_cert {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerification))
+        } else if let Some(ref verifier) = self.server_cert_verifier {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(verifier.clone())
+        } else {
             let mut root_store = RootCertStore::empty();
 
             if self.use_system_roots {
@@ -171,49 +205,19 @@ impl QuicConfig {
                 }
             }
 
+            builder.with_root_certificates(root_store)
+        };
+
+        let mut crypto =
             if let (Some(ref cert_chain), Some(ref key)) = (&self.client_cert, &self.client_key) {
-                RustlsClientConfig::builder_with_provider(crypto_provider)
-                    .with_safe_default_protocol_versions()
-                    .map_err(|e| {
-                        MqttError::ConnectionError(format!("Failed to set protocol versions: {e}"))
-                    })?
-                    .with_root_certificates(root_store)
+                builder
                     .with_client_auth_cert(cert_chain.clone(), key.clone_key())
                     .map_err(|e| {
                         MqttError::ConnectionError(format!("Failed to configure client cert: {e}"))
                     })?
             } else {
-                RustlsClientConfig::builder_with_provider(crypto_provider)
-                    .with_safe_default_protocol_versions()
-                    .map_err(|e| {
-                        MqttError::ConnectionError(format!("Failed to set protocol versions: {e}"))
-                    })?
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth()
-            }
-        } else if let (Some(ref cert_chain), Some(ref key)) = (&self.client_cert, &self.client_key)
-        {
-            RustlsClientConfig::builder_with_provider(crypto_provider.clone())
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    MqttError::ConnectionError(format!("Failed to set protocol versions: {e}"))
-                })?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerification))
-                .with_client_auth_cert(cert_chain.clone(), key.clone_key())
-                .map_err(|e| {
-                    MqttError::ConnectionError(format!("Failed to configure client cert: {e}"))
-                })?
-        } else {
-            RustlsClientConfig::builder_with_provider(crypto_provider.clone())
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    MqttError::ConnectionError(format!("Failed to set protocol versions: {e}"))
-                })?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerification))
-                .with_no_client_auth()
-        };
+                builder.with_no_client_auth()
+            };
 
         if self.enable_early_data {
             crypto.enable_early_data = true;

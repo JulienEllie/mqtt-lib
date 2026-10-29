@@ -2,6 +2,7 @@ use crate::crypto::NoVerification;
 use crate::error::{MqttError, Result};
 use crate::time::Duration;
 use crate::Transport;
+use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -43,6 +44,9 @@ pub struct TlsConfig {
     pub use_system_roots: bool,
     /// Whether to verify server certificate
     pub verify_server_cert: bool,
+    /// Verifier of the server certificate, used in place of the root
+    /// certificates when the server certificate is verified (optional)
+    pub server_cert_verifier: Option<Arc<dyn ServerCertVerifier>>,
     /// ALPN protocols (optional)
     pub alpn_protocols: Option<Vec<Vec<u8>>>,
 }
@@ -58,6 +62,7 @@ impl Clone for TlsConfig {
             root_certs: self.root_certs.clone(),
             use_system_roots: self.use_system_roots,
             verify_server_cert: self.verify_server_cert,
+            server_cert_verifier: self.server_cert_verifier.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
         }
     }
@@ -76,6 +81,7 @@ impl TlsConfig {
             root_certs: None,
             use_system_roots: true,
             verify_server_cert: true,
+            server_cert_verifier: None,
             alpn_protocols: None,
         }
     }
@@ -122,6 +128,24 @@ impl TlsConfig {
     #[must_use]
     pub fn with_verify_server_cert(mut self, verify: bool) -> Self {
         self.verify_server_cert = verify;
+        self
+    }
+
+    /// Sets the verifier of the server certificate
+    ///
+    /// It replaces the root certificates, custom and system ones: it alone
+    /// decides whether the server certificate is accepted, for example by
+    /// checking it against the root certificates and also requiring a known
+    /// public key. It is given the whole check: the server name and the
+    /// handshake's signatures (`verify_tls12_signature`,
+    /// `verify_tls13_signature`) as well as the chain, which a verifier can
+    /// leave to rustls's `WebPkiServerVerifier` before checking more.
+    /// Disabling verification with
+    /// [`with_verify_server_cert`](Self::with_verify_server_cert) still
+    /// disables it, the verifier included.
+    #[must_use]
+    pub fn with_server_cert_verifier(mut self, verifier: Arc<dyn ServerCertVerifier>) -> Self {
+        self.server_cert_verifier = Some(verifier);
         self
     }
 
@@ -332,9 +356,18 @@ impl TlsConfig {
     /// Builds the rustls client configuration, taking the system roots that
     /// `use_system_roots` adds from `system_roots`
     ///
-    /// Roots are only loaded when the server certificate is verified.
+    /// Roots are only loaded when the server certificate is verified, and no
+    /// verifier replaces them.
     pub(crate) fn client_config_with(&self, system_roots: SystemRoots) -> Result<ClientConfig> {
-        let config_builder = if self.verify_server_cert {
+        let verifier = self
+            .server_cert_verifier
+            .clone()
+            .filter(|_| self.verify_server_cert);
+        let config_builder = if let Some(verifier) = verifier {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+        } else if self.verify_server_cert {
             let mut root_store = RootCertStore::empty();
 
             // Add custom root certificates

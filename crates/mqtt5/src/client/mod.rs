@@ -135,6 +135,8 @@ pub struct MqttClient {
     pub(crate) connection_mutex: Arc<tokio::sync::Mutex<()>>,
     pub(crate) monitor_wakeup: Arc<tokio::sync::Notify>,
     pub(crate) tls_config: Arc<RwLock<StoredTlsConfig>>,
+    pub(crate) server_cert_verifier:
+        Arc<RwLock<Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>>>,
     pub(crate) transport_config: Arc<RwLock<crate::transport::ClientTransportConfig>>,
     #[cfg(feature = "transport-quic")]
     pub(crate) quic_client_config: Arc<RwLock<Option<(inner::QuicBuiltFor, quinn::ClientConfig)>>>,
@@ -321,6 +323,10 @@ impl MqttClient {
     /// ([`ConnectOptions::with_automatic_reconnect`]). A server redirect is
     /// followed with it too, to an mqtts:// address only. It is also stored
     /// for later connections made from a URL, as with `set_tls_config`.
+    ///
+    /// The server's certificate is checked as the configuration says: with
+    /// its own verifier or root certificates, not with a verifier set with
+    /// [`set_server_cert_verifier`](Self::set_server_cert_verifier).
     ///
     /// # Errors
     ///
