@@ -308,11 +308,14 @@ fn write_report(
         }),
         Mode::Client(sut) => {
             let capabilities = sut.capabilities();
+            let supported: Vec<&str> = capabilities
+                .supported
+                .iter()
+                .map(|requirement| requirement.label())
+                .collect();
             serde_json::json!({
                 "client": sut.name(),
-                "automatic_reconnect": capabilities.automatic_reconnect,
-                "offline_queue": capabilities.offline_queue,
-                "enhanced_auth": capabilities.enhanced_auth,
+                "supported": supported,
             })
         }
     };

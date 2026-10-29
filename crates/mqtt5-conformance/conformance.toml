@@ -412,7 +412,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Server MUST NOT send packets exceeding Maximum Packet Size to the Client"
 status = "Tested"
-test_names = ["server_discards_oversized_publish", "connack_reason_string_omitted_over_max_packet_size"]
+test_names = ["server_discards_oversized_publish", "connack_reason_string_omitted_over_max_packet_size", "inbound_packet_above_client_maximum_packet_size"]
 
 [[sections."3.1".statements]]
 id = "MQTT-3.1.2-25"
@@ -597,9 +597,8 @@ id = "MQTT-3.2.2-5"
 level = "Must"
 applies_to = "Client"
 text = "If the Client does have Session State and receives Session Present set to 0 it MUST discard its Session State if it continues with the Network Connection."
-status = "NotApplicable"
-test_names = []
-note = "Client-side behavior"
+status = "Tested"
+test_names = ["queued_acks_discarded_when_session_not_present"]
 
 [[sections."3.2".statements]]
 id = "MQTT-3.2.2-6"
@@ -763,7 +762,7 @@ level = "Must"
 applies_to = "Both"
 text = "The DUP flag MUST be set to 0 for all QoS 0 messages."
 status = "Tested"
-test_names = ["publish_dup_must_be_zero_for_qos0", "qos0_server_outbound_publish_has_dup_zero", "qos0_publish_has_no_packet_id_and_zero_property_length"]
+test_names = ["publish_dup_must_be_zero_for_qos0", "qos0_server_outbound_publish_has_dup_zero", "qos0_publish_has_no_packet_id_and_zero_property_length", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.1-3"
@@ -779,7 +778,7 @@ level = "Must"
 applies_to = "Both"
 text = "A PUBLISH packet MUST NOT have both QoS bits set to 1. If a Server or Client receives a PUBLISH packet which has both QoS bits set to 1 it is a Malformed Packet."
 status = "Tested"
-test_names = ["publish_qos3_is_malformed"]
+test_names = ["publish_qos3_is_malformed", "inbound_qos3_publish_is_malformed"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.1-5"
@@ -858,8 +857,8 @@ id = "MQTT-3.3.2-1"
 level = "Must"
 applies_to = "Both"
 text = "The Topic Name MUST be present as the first field in the PUBLISH packet Variable Header. It MUST be a UTF-8 Encoded String."
-status = "Untested"
-test_names = []
+status = "Tested"
+test_names = ["utf8_string_fields_reject_nul"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.2-2"
@@ -915,7 +914,7 @@ level = "Must"
 applies_to = "Both"
 text = "A sender MUST NOT send a PUBLISH packet containing a Topic Alias which has the value 0."
 status = "Tested"
-test_names = ["publish_topic_alias_zero_rejected"]
+test_names = ["publish_topic_alias_zero_rejected", "client_must_not_send_topic_alias_zero", "inbound_topic_alias_zero_is_protocol_error", "inbound_topic_alias_zero_with_empty_topic_is_topic_alias_invalid"]
 note = "Corrected: previously carried the text of MQTT-3.3.2-11 and was exempted as 'Server-to-client alias usage'. This is the alias-value-0 requirement"
 
 [[sections."3.3".statements]]
@@ -923,26 +922,24 @@ id = "MQTT-3.3.2-9"
 level = "Must"
 applies_to = "Client"
 text = "A Client MUST NOT send a PUBLISH packet with a Topic Alias greater than the Topic Alias Maximum value returned by the Server in the CONNACK packet."
-status = "NotApplicable"
-test_names = []
-note = "Client-side constraint"
+status = "Tested"
+test_names = ["client_must_not_exceed_server_topic_alias_maximum"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.2-10"
 level = "Must"
 applies_to = "Client"
 text = "A Client MUST accept all Topic Alias values greater than 0 and less than or equal to the Topic Alias Maximum value that it sent in the CONNECT packet."
-status = "NotApplicable"
-test_names = []
-note = "Client-side behavior. Previously held the Topic Alias scoping rule (MQTT-3.3.2-7); its tests moved there."
+status = "Tested"
+test_names = ["client_accepts_topic_alias_within_its_maximum"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.2-11"
 level = "Must"
 applies_to = "Server"
 text = "A Server MUST NOT send a PUBLISH packet with a Topic Alias greater than the Topic Alias Maximum value sent by the Client in the CONNECT packet."
-status = "Untested"
-test_names = []
+status = "Tested"
+test_names = ["inbound_topic_alias_above_maximum_is_protocol_error", "inbound_topic_alias_above_maximum_with_empty_topic_is_topic_alias_invalid"]
 note = "Fixed (#130): resolve_topic_alias strips the publisher's inbound alias before delivery, so no Topic Alias reaches a subscriber. topic_alias_not_shared_across_connections and topic_alias_cleared_on_reconnect additionally exercise connection-scoped mapping"
 
 [[sections."3.3".statements]]
@@ -958,8 +955,8 @@ id = "MQTT-3.3.2-13"
 level = "Must"
 applies_to = "Both"
 text = "The Response Topic MUST be a UTF-8 Encoded String."
-status = "Untested"
-test_names = []
+status = "Tested"
+test_names = ["utf8_string_fields_reject_nul"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.2-14"
@@ -967,7 +964,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Response Topic MUST NOT contain wildcard characters."
 status = "Tested"
-test_names = ["response_topic_wildcard_rejected"]
+test_names = ["response_topic_wildcard_rejected", "response_topic_must_not_contain_wildcards"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.2-15"
@@ -1006,8 +1003,8 @@ id = "MQTT-3.3.2-19"
 level = "Must"
 applies_to = "Both"
 text = "The Content Type MUST be a UTF-8 Encoded String."
-status = "Untested"
-test_names = []
+status = "Tested"
+test_names = ["utf8_string_fields_reject_nul"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.2-20"
@@ -1023,7 +1020,7 @@ level = "Must"
 applies_to = "Server"
 text = "The receiver of a PUBLISH Packet MUST respond with the packet as determined by the QoS in the PUBLISH Packet."
 status = "Tested"
-test_names = ["publish_qos1_puback_response", "publish_qos2_full_flow"]
+test_names = ["publish_qos1_puback_response", "publish_qos2_full_flow", "client_acks_inbound_by_qos"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.4-2"
@@ -1063,25 +1060,24 @@ level = "Must"
 applies_to = "Both"
 text = "A PUBLISH packet sent from a Client to a Server MUST NOT contain a Subscription Identifier."
 status = "Tested"
-test_names = ["publish_subscription_id_from_client_rejected"]
+test_names = ["publish_subscription_id_from_client_rejected", "client_publish_must_not_contain_subscription_identifier"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.4-7"
 level = "Must"
 applies_to = "Client"
 text = "The Client MUST NOT send more than Receive Maximum QoS 1 and QoS 2 PUBLISH packets for which it has not received PUBACK, PUBCOMP, or PUBREC with a Reason Code of 128 or greater from the Server."
-status = "NotApplicable"
-test_names = []
-note = "Client-side flow control behavior. Previously held the text of MQTT-3.3.4-9; its test moved there."
+status = "Tested"
+test_names = ["session_resume_with_smaller_receive_maximum", "queued_messages_flushed_within_server_receive_maximum"]
+note = "Previously held the text of MQTT-3.3.4-9; its test moved there."
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.4-8"
 level = "Must"
 applies_to = "Client"
 text = "The Client MUST NOT delay the sending of any packets other than PUBLISH packets due to having sent Receive Maximum PUBLISH packets without receiving acknowledgements for them."
-status = "NotApplicable"
-test_names = []
-note = "Client-side flow control behavior."
+status = "Tested"
+test_names = ["disconnect_not_delayed_by_exhausted_send_quota"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.4-9"
@@ -1089,7 +1085,7 @@ level = "Must"
 applies_to = "Server"
 text = "The Server MUST NOT send more than Receive Maximum QoS 1 and QoS 2 PUBLISH packets for which it has not received PUBACK, PUBCOMP, or PUBREC with a Reason Code of 128 or greater from the Client."
 status = "Tested"
-test_names = ["receive_maximum_limits_outbound_publishes", "deferred_qos2_slot_held_until_pubcomp", "flow_control_quota_enforced"]
+test_names = ["receive_maximum_limits_outbound_publishes", "deferred_qos2_slot_held_until_pubcomp", "flow_control_quota_enforced", "server_exceeding_client_receive_maximum_gets_disconnect_0x93"]
 
 [[sections."3.3".statements]]
 id = "MQTT-3.3.4-10"
@@ -1119,7 +1115,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Client or Server sending the PUBACK packet MUST use one of the PUBACK Reason Codes."
 status = "Tested"
-test_names = ["puback_correct_packet_id_and_reason"]
+test_names = ["puback_correct_packet_id_and_reason", "client_acks_inbound_by_qos", "deferred_reject_puback_reason_code_must_be_valid"]
 
 # ===========================================================================
 # Section 3.5 — PUBREC
@@ -1159,7 +1155,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Client or Server sending the PUBREC packet MUST use one of the PUBREC Reason Codes."
 status = "Tested"
-test_names = ["pubrec_correct_packet_id_and_reason"]
+test_names = ["pubrec_correct_packet_id_and_reason", "client_acks_inbound_by_qos", "deferred_reject_pubrec_reason_code_must_be_valid"]
 
 # ===========================================================================
 # Section 3.6 — PUBREL
@@ -1198,7 +1194,7 @@ level = "Must"
 applies_to = "Both"
 text = "Bits 3,2,1 and 0 of the Fixed Header in the PUBREL packet are reserved and MUST be set to 0,0,1 and 0 respectively. The Server MUST treat any other value as malformed and close the Network Connection."
 status = "Tested"
-test_names = ["pubrel_invalid_flags_rejected", "server_pubrel_correct_flags", "qos2_server_sends_pubrel_after_pubrec_and_holds_until_pubcomp"]
+test_names = ["pubrel_invalid_flags_rejected", "server_pubrel_correct_flags", "qos2_server_sends_pubrel_after_pubrec_and_holds_until_pubcomp", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 [[sections."3.6".statements]]
 id = "MQTT-3.6.2-1"
@@ -1206,7 +1202,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Client or Server sending the PUBREL packet MUST use one of the PUBREL Reason Codes."
 status = "Tested"
-test_names = ["server_pubrel_correct_flags", "qos2_server_sends_pubrel_after_pubrec_and_holds_until_pubcomp"]
+test_names = ["server_pubrel_correct_flags", "qos2_server_sends_pubrel_after_pubrec_and_holds_until_pubcomp", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 
 # ===========================================================================
@@ -1246,7 +1242,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Client or Server sending the PUBCOMP packets MUST use one of the PUBCOMP Reason Codes."
 status = "Tested"
-test_names = ["pubcomp_correct_packet_id_and_reason", "pubrel_unknown_packet_id"]
+test_names = ["pubcomp_correct_packet_id_and_reason", "pubrel_unknown_packet_id", "client_acks_inbound_by_qos", "pubrel_for_unknown_id_is_completed"]
 
 
 # ===========================================================================
@@ -1286,7 +1282,7 @@ level = "Must"
 applies_to = "Both"
 text = "Bits 3,2,1 and 0 of the Fixed Header of the SUBSCRIBE packet are reserved and MUST be set to 0,0,1 and 0 respectively. The Server MUST treat any other value as malformed and close the Network Connection"
 status = "Tested"
-test_names = ["subscribe_invalid_flags_rejected"]
+test_names = ["subscribe_invalid_flags_rejected", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 [[sections."3.8".statements]]
 id = "MQTT-3.8.3-3"
@@ -1330,7 +1326,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Payload MUST contain at least one Topic Filter and Subscription Options pair . A SUBSCRIBE packet with no Payload is a Protocol Error"
 status = "Tested"
-test_names = ["subscribe_empty_payload_rejected"]
+test_names = ["subscribe_empty_payload_rejected", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 [[sections."3.8".statements]]
 id = "MQTT-3.8.3-5"
@@ -1346,7 +1342,7 @@ level = "Must"
 applies_to = "Both"
 text = "The SUBACK packet MUST have the same Packet Identifier as the SUBSCRIBE packet that it is acknowledging"
 status = "Tested"
-test_names = ["suback_packet_id_matches"]
+test_names = ["suback_packet_id_matches", "suback_with_foreign_packet_id_is_not_accepted"]
 
 [[sections."3.8".statements]]
 id = "MQTT-3.8.4-3"
@@ -1462,7 +1458,7 @@ level = "Must"
 applies_to = "Both"
 text = "Bits 3,2,1 and 0 of the Fixed Header of the UNSUBSCRIBE packet are reserved and MUST be set to 0,0,1 and 0 respectively. The Server MUST treat any other value as malformed and close the Network Connection"
 status = "Tested"
-test_names = ["unsubscribe_invalid_flags_rejected"]
+test_names = ["unsubscribe_invalid_flags_rejected", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 [[sections."3.10".statements]]
 id = "MQTT-3.10.3-2"
@@ -1470,7 +1466,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Payload of an UNSUBSCRIBE packet MUST contain at least one Topic Filter."
 status = "Tested"
-test_names = ["unsubscribe_empty_payload_rejected"]
+test_names = ["unsubscribe_empty_payload_rejected", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 [[sections."3.10".statements]]
 id = "MQTT-3.10.4-1"
@@ -1817,7 +1813,7 @@ level = "Must"
 applies_to = "Both"
 text = "MUST send a PUBLISH packet containing this Packet Identifier with QoS 1 and DUP flag set to 0"
 status = "Tested"
-test_names = ["qos1_server_outbound_unique_nonzero_id_and_dup_zero"]
+test_names = ["qos1_server_outbound_unique_nonzero_id_and_dup_zero", "queued_message_first_transmission_has_dup_zero"]
 
 [[sections."4.3".statements]]
 id = "MQTT-4.3.2-4"
@@ -1833,8 +1829,8 @@ id = "MQTT-4.3.2-5"
 level = "Must"
 applies_to = "Server"
 text = "After it has sent a PUBACK packet the receiver MUST treat any incoming PUBLISH packet that contains the same Packet Identifier as being a new Application Message, irrespective of the setting of its DUP flag"
-status = "Untested"
-test_names = []
+status = "Tested"
+test_names = ["qos1_id_reuse_after_puback_is_new_message"]
 
 [[sections."4.3".statements]]
 id = "MQTT-4.3.3-1"
@@ -1850,7 +1846,7 @@ level = "Must"
 applies_to = "Both"
 text = "MUST send a PUBLISH packet containing this Packet Identifier with QoS 2 and DUP flag set to 0"
 status = "Tested"
-test_names = ["qos2_server_outbound_unique_nonzero_id_and_dup_zero"]
+test_names = ["qos2_server_outbound_unique_nonzero_id_and_dup_zero", "subscribe_unsubscribe_and_pubrel_wire_format"]
 
 [[sections."4.3".statements]]
 id = "MQTT-4.3.3-3"
@@ -1915,7 +1911,7 @@ level = "MustNot"
 applies_to = "Both"
 text = "It MUST NOT cause duplicate messages to be delivered to any onward recipients in this case"
 status = "Tested"
-test_names = ["qos2_duplicate_publish_no_double_delivery"]
+test_names = ["qos2_duplicate_publish_no_double_delivery", "duplicate_qos2_before_pubrel_delivered_once_then_id_reusable"]
 
 [[sections."4.3".statements]]
 id = "MQTT-4.3.3-11"
@@ -1923,7 +1919,7 @@ level = "Must"
 applies_to = "Both"
 text = "MUST respond to a PUBREL packet by sending a PUBCOMP packet containing the same Packet Identifier as the PUBREL"
 status = "Tested"
-test_names = ["pubcomp_correct_packet_id_and_reason", "publish_qos2_full_flow", "pubrel_unknown_packet_id"]
+test_names = ["pubcomp_correct_packet_id_and_reason", "publish_qos2_full_flow", "pubrel_unknown_packet_id", "client_acks_inbound_by_qos", "pubrel_for_unknown_id_is_completed"]
 note = "Promoted from CrossRef: previously pointed at MQTT-3.6.4-1, an ID in neither v5.0 nor v3.1.1. Tests moved here"
 
 [[sections."4.3".statements]]
@@ -1932,7 +1928,7 @@ level = "Must"
 applies_to = "Server"
 text = "After it has sent a PUBCOMP, the receiver MUST treat any subsequent PUBLISH packet that contains that Packet Identifier as being a new Application Message"
 status = "Tested"
-test_names = ["qos2_after_pubcomp_same_id_is_new_message"]
+test_names = ["qos2_after_pubcomp_same_id_is_new_message", "duplicate_qos2_before_pubrel_delivered_once_then_id_reusable"]
 
 [[sections."4.3".statements]]
 id = "MQTT-4.3.3-13"
@@ -2211,7 +2207,7 @@ level = "Must"
 applies_to = "Both"
 text = "The Client or Server MUST set its initial send quota to a non-zero value not exceeding the Receive Maximum"
 status = "Tested"
-test_names = ["flow_control_quota_enforced", "deferred_qos2_slot_held_until_pubcomp", "receive_maximum_limits_outbound_publishes"]
+test_names = ["flow_control_quota_enforced", "deferred_qos2_slot_held_until_pubcomp", "receive_maximum_limits_outbound_publishes", "send_quota_reinitialized_on_new_connection"]
 
 [[sections."4.9".statements]]
 id = "MQTT-4.9.0-2"
@@ -2219,7 +2215,7 @@ level = "MustNot"
 applies_to = "Both"
 text = "Each time the Client or Server sends a PUBLISH packet at QoS > 0, it decrements the send quota. If the send quota reaches zero, the Client or Server MUST NOT send any more PUBLISH packets with QoS > 0."
 status = "Tested"
-test_names = ["flow_control_quota_enforced", "deferred_qos2_slot_held_until_pubcomp", "receive_maximum_limits_outbound_publishes"]
+test_names = ["flow_control_quota_enforced", "deferred_qos2_slot_held_until_pubcomp", "receive_maximum_limits_outbound_publishes", "session_resume_with_smaller_receive_maximum"]
 
 [[sections."4.9".statements]]
 id = "MQTT-4.9.0-3"

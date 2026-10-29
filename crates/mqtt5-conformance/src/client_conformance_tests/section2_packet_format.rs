@@ -34,7 +34,7 @@ async fn reserved_flags_on_inbound_puback_is_malformed(sut: ClientSutHandle) {
 async fn reserved_flags_on_inbound_suback_is_malformed(sut: ClientSutHandle) {
     let mut s = start(&sut, ConnectSpec::new("flags-suback"), false, &[]).await;
     s.result.as_ref().unwrap();
-    let subscribing = tokio::spawn(s.client.subscribe("s/t"));
+    let subscribing = tokio::spawn(s.client.subscribe("s/t", 0));
     let subscribe = s.conn.next_of_type(SUBSCRIBE, TIMEOUT).await.unwrap();
     let packet_id = subscribe.leading_packet_id().unwrap();
     s.conn
@@ -126,7 +126,7 @@ async fn acks_echo_inbound_packet_id(sut: ClientSutHandle) {
 async fn outbound_reserved_flags_and_nonzero_packet_ids(sut: ClientSutHandle) {
     let mut s = start(&sut, ConnectSpec::new("out-flags"), false, &[]).await;
     s.result.as_ref().unwrap();
-    let subscribing = tokio::spawn(s.client.subscribe("s/t"));
+    let subscribing = tokio::spawn(s.client.subscribe("s/t", 0));
     let subscribe = s.conn.next_of_type(SUBSCRIBE, TIMEOUT).await.unwrap();
     assert_eq!(subscribe.flags(), 0x02, "[MQTT-2.1.3-1] SUBSCRIBE flags");
     let packet_id = subscribe.leading_packet_id().unwrap();

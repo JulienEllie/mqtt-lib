@@ -20,7 +20,9 @@ pub const PROP_ASSIGNED_CLIENT_IDENTIFIER: u8 = 0x12;
 pub const PROP_SERVER_KEEP_ALIVE: u8 = 0x13;
 pub const PROP_AUTHENTICATION_METHOD: u8 = 0x15;
 pub const PROP_REASON_STRING: u8 = 0x1F;
+pub const PROP_RECEIVE_MAXIMUM: u8 = 0x21;
 pub const PROP_TOPIC_ALIAS_MAXIMUM: u8 = 0x22;
+pub const PROP_TOPIC_ALIAS: u8 = 0x23;
 pub const PROP_MAXIMUM_QOS: u8 = 0x24;
 pub const PROP_RETAIN_AVAILABLE: u8 = 0x25;
 pub const PROP_USER_PROPERTY: u8 = 0x26;
@@ -71,6 +73,11 @@ impl Packet {
     #[must_use]
     pub fn leading_packet_id(&self) -> Option<u16> {
         Some(u16::from_be_bytes(*self.body().first_chunk()?))
+    }
+
+    #[must_use]
+    pub fn ack_reason_code(&self) -> u8 {
+        self.body().get(2).copied().unwrap_or(0x00)
     }
 }
 
@@ -249,6 +256,11 @@ pub fn connack(session_present: bool, props: &[u8]) -> Vec<u8> {
     let mut body = vec![u8::from(session_present), 0x00];
     body.extend(properties(props));
     wrap_fixed_header(0x20, &body)
+}
+
+#[must_use]
+pub fn publish_first_byte(qos: u8, dup: bool) -> u8 {
+    0x30 | (u8::from(dup) << 3) | (qos << 1)
 }
 
 #[must_use]

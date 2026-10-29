@@ -1,12 +1,13 @@
 use super::common::{
-    accept_next, begin, drop_connection, parse_publish, read_connect, start, TIMEOUT,
+    accept_next, begin, drop_connection, parse_publish, read_connect, received_after, start,
+    subscribe_and_ack, SHORT, TIMEOUT,
 };
 use crate::client_conformance_test;
 use crate::client_sut::{AuthSpec, ClientSutHandle, ConnectSpec, PublishSpec, WillSpec};
 use crate::packet_parser::ParsedConnect;
 use crate::scripted_broker::{
-    ack, ack_with_properties, auth, connack, property_string, property_u16, subscription_ack,
-    user_property, Next, ScriptedBroker, AUTH, DISCONNECT, PINGREQ,
+    ack, ack_with_properties, auth, connack, property_string, property_u16, publish,
+    subscription_ack, user_property, Next, ScriptedBroker, AUTH, DISCONNECT, PINGREQ,
     PROP_ASSIGNED_CLIENT_IDENTIFIER, PROP_AUTHENTICATION_METHOD, PROP_REASON_STRING,
     PROP_SERVER_KEEP_ALIVE, PUBLISH, PUBREL, SUBSCRIBE,
 };
@@ -308,7 +309,7 @@ async fn user_property_on_suback_with_problem_information_0_disconnects(sut: Cli
     let spec = ConnectSpec::new("rpi-suback").without_problem_information();
     let mut s = start(&sut, spec, false, &[]).await;
     s.result.as_ref().unwrap();
-    let subscribing = tokio::spawn(s.client.subscribe("s/t"));
+    let subscribing = tokio::spawn(s.client.subscribe("s/t", 0));
     let subscribe = s.conn.next_of_type(SUBSCRIBE, TIMEOUT).await.unwrap();
     let packet_id = subscribe.leading_packet_id().unwrap();
     s.conn
@@ -406,7 +407,7 @@ async fn only_auth_before_connack_when_auth_method_set(sut: ClientSutHandle) {
         for _ in 0..50 {
             let publish = spam.publish("x", b"y", PublishSpec::default());
             calls.spawn(async move { publish.await.is_ok() });
-            let subscribe = spam.subscribe("z");
+            let subscribe = spam.subscribe("z", 0);
             calls.spawn(async move { subscribe.await.is_ok() });
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -436,5 +437,33 @@ async fn only_auth_before_connack_when_auth_method_set(sut: ClientSutHandle) {
     assert!(
         before_connack.contains(&AUTH),
         "client did not answer AUTH challenge"
+    );
+}
+
+/// [MQTT-3.1.2-24] A server that sends a packet larger than the Client's
+/// Maximum Packet Size breaks the rule; the Client does not deliver it and
+/// ends the connection (DISCONNECT 0x95 or a close).
+#[client_conformance_test(ids = ["MQTT-3.1.2-24"])]
+async fn inbound_packet_above_client_maximum_packet_size(sut: ClientSutHandle) {
+    let mut s = start(
+        &sut,
+        ConnectSpec::new("conn-maxpkt").with_maximum_packet_size(128),
+        false,
+        &[],
+    )
+    .await;
+    s.result.as_ref().unwrap();
+    subscribe_and_ack(&mut s, "t/big", 0).await;
+    s.conn
+        .send(&publish(0x30, b"t/big", None, &[], &[b'x'; 1000]))
+        .await
+        .unwrap();
+    let delivered = received_after(&s.client, SHORT).await.len();
+    let close = s.conn.observe_close(Duration::from_secs(3)).await;
+    assert!(
+        delivered == 0 && close.disconnect_reason.map_or(close.closed, |rc| rc == 0x95),
+        "[MQTT-3.1.2-24] packet larger than client Maximum Packet Size 128 was not refused; delivered={delivered} closed={} DISCONNECT reason {:?}",
+        close.closed,
+        close.disconnect_reason
     );
 }

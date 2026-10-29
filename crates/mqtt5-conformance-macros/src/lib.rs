@@ -218,10 +218,11 @@ fn client_requirement_to_tokens(spec: &LitStr) -> syn::Result<proc_macro2::Token
         "client.automatic_reconnect" => quote! { AutomaticReconnect },
         "client.offline_queue" => quote! { OfflineQueue },
         "client.enhanced_auth" => quote! { EnhancedAuth },
+        "client.deferred_ack" => quote! { DeferredAck },
         _ => {
             return Err(Error::new_spanned(
                 spec,
-                "unknown client requirement (expected client.automatic_reconnect, client.offline_queue or client.enhanced_auth)",
+                "unknown client requirement (expected client.automatic_reconnect, client.offline_queue, client.enhanced_auth or client.deferred_ack)",
             ));
         }
     };

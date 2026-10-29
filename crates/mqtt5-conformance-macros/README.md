@@ -51,7 +51,7 @@ The `requires` parameter accepts these capability strings:
 | `sys_topics_published` | SUT publishes retained `$SYS` topics of its own |
 | `no_server_keep_alive` | SUT sends no Server Keep Alive in CONNACK |
 
-`#[client_conformance_test]` accepts the client requirement strings instead: `client.automatic_reconnect`, `client.offline_queue` and `client.enhanced_auth`.
+`#[client_conformance_test]` accepts the client requirement strings instead: `client.automatic_reconnect`, `client.offline_queue`, `client.enhanced_auth` and `client.deferred_ack`.
 
 All requirement strings are validated at compile time. Invalid strings produce a compilation error.
 

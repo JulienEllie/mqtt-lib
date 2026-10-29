@@ -30,6 +30,10 @@ pub struct ConnectSpec {
     pub credentials: Option<(String, Vec<u8>)>,
     pub authentication: Option<AuthSpec>,
     pub request_problem_information: Option<bool>,
+    pub receive_maximum: Option<u16>,
+    pub topic_alias_maximum: Option<u16>,
+    pub maximum_packet_size: Option<u32>,
+    pub deferred_ack: bool,
 }
 
 impl ConnectSpec {
@@ -45,6 +49,10 @@ impl ConnectSpec {
             credentials: None,
             authentication: None,
             request_problem_information: None,
+            receive_maximum: None,
+            topic_alias_maximum: None,
+            maximum_packet_size: None,
+            deferred_ack: false,
         }
     }
 
@@ -62,8 +70,13 @@ impl ConnectSpec {
     }
 
     #[must_use]
-    pub fn reconnecting(mut self) -> Self {
-        self.reconnect_delay = Some((Duration::from_millis(100), Duration::from_millis(300)));
+    pub fn reconnecting(self) -> Self {
+        self.reconnecting_after(Duration::from_millis(100), Duration::from_millis(300))
+    }
+
+    #[must_use]
+    pub fn reconnecting_after(mut self, initial: Duration, max: Duration) -> Self {
+        self.reconnect_delay = Some((initial, max));
         self
     }
 
@@ -90,13 +103,40 @@ impl ConnectSpec {
         self.request_problem_information = Some(false);
         self
     }
+
+    #[must_use]
+    pub fn with_receive_maximum(mut self, receive_maximum: u16) -> Self {
+        self.receive_maximum = Some(receive_maximum);
+        self
+    }
+
+    #[must_use]
+    pub fn with_topic_alias_maximum(mut self, topic_alias_maximum: u16) -> Self {
+        self.topic_alias_maximum = Some(topic_alias_maximum);
+        self
+    }
+
+    #[must_use]
+    pub fn with_maximum_packet_size(mut self, maximum_packet_size: u32) -> Self {
+        self.maximum_packet_size = Some(maximum_packet_size);
+        self
+    }
+
+    #[must_use]
+    pub fn with_deferred_ack(mut self) -> Self {
+        self.deferred_ack = true;
+        self
+    }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PublishSpec {
     pub qos: u8,
     pub retain: bool,
     pub topic_alias: Option<u16>,
+    pub response_topic: Option<String>,
+    pub content_type: Option<String>,
+    pub subscription_identifiers: Vec<u32>,
 }
 
 impl PublishSpec {
@@ -123,6 +163,12 @@ pub enum PublishOutcome {
 #[derive(Debug, Clone)]
 pub struct ClientError(pub String);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settle {
+    Ack,
+    Reject(u8),
+}
+
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
     pub topic: String,
@@ -137,7 +183,9 @@ pub trait ClientUnderTest: Send + Sync {
         payload: &[u8],
         spec: PublishSpec,
     ) -> ClientFuture<Result<PublishOutcome, ClientError>>;
-    fn subscribe(&self, filter: &str) -> ClientFuture<Result<(), ClientError>>;
+    fn subscribe(&self, filter: &str, qos: u8) -> ClientFuture<Result<(), ClientError>>;
+    fn subscribe_deferred(&self, filter: &str, qos: u8) -> ClientFuture<Result<(), ClientError>>;
+    fn settle_deferred(&self, settle: Settle) -> usize;
     fn unsubscribe(&self, filter: &str) -> ClientFuture<Result<(), ClientError>>;
     fn disconnect(&self) -> ClientFuture<Result<(), ClientError>>;
     fn reauthenticate(&self) -> ClientFuture<Result<(), ClientError>>;
@@ -147,9 +195,7 @@ pub trait ClientUnderTest: Send + Sync {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ClientCapabilities {
-    pub automatic_reconnect: bool,
-    pub offline_queue: bool,
-    pub enhanced_auth: bool,
+    pub supported: &'static [ClientRequirement],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,16 +203,13 @@ pub enum ClientRequirement {
     AutomaticReconnect,
     OfflineQueue,
     EnhancedAuth,
+    DeferredAck,
 }
 
 impl ClientRequirement {
     #[must_use]
     pub fn matches(self, capabilities: &ClientCapabilities) -> bool {
-        match self {
-            Self::AutomaticReconnect => capabilities.automatic_reconnect,
-            Self::OfflineQueue => capabilities.offline_queue,
-            Self::EnhancedAuth => capabilities.enhanced_auth,
-        }
+        capabilities.supported.contains(&self)
     }
 
     #[must_use]
@@ -175,6 +218,7 @@ impl ClientRequirement {
             Self::AutomaticReconnect => "client.automatic_reconnect",
             Self::OfflineQueue => "client.offline_queue",
             Self::EnhancedAuth => "client.enhanced_auth",
+            Self::DeferredAck => "client.deferred_ack",
         }
     }
 }
@@ -193,12 +237,14 @@ pub use inprocess::inprocess_client;
 #[cfg(feature = "inprocess-fixture")]
 mod inprocess {
     use super::{
-        AuthSpec, ClientCapabilities, ClientError, ClientFuture, ClientSut, ClientSutHandle,
-        ClientUnderTest, ConnectOutcome, ConnectSpec, PublishOutcome, PublishSpec, ReceivedMessage,
+        AuthSpec, ClientCapabilities, ClientError, ClientFuture, ClientRequirement, ClientSut,
+        ClientSutHandle, ClientUnderTest, ConnectOutcome, ConnectSpec, PublishOutcome, PublishSpec,
+        ReceivedMessage, Settle,
     };
+    use mqtt5::protocol::v5::reason_codes::ReasonCode;
     use mqtt5::{
-        AuthHandler, AuthResponse, ConnectOptions, MqttClient, PublishOptions, PublishProperties,
-        PublishResult, QoS, WillMessage,
+        AckToken, AuthHandler, AuthResponse, ConnectOptions, MqttClient, PublishOptions,
+        PublishProperties, PublishResult, QoS, SubscribeOptions, WillMessage,
     };
     use std::future::Future;
     use std::pin::Pin;
@@ -265,7 +311,12 @@ mod inprocess {
             options.properties.authentication_method = Some(authentication.method.clone());
         }
         options.properties.request_problem_information = spec.request_problem_information;
-        options
+        if let Some(receive_maximum) = spec.receive_maximum {
+            options = options.with_receive_maximum(receive_maximum);
+        }
+        options.properties.topic_alias_maximum = spec.topic_alias_maximum;
+        options.properties.maximum_packet_size = spec.maximum_packet_size;
+        options.with_deferred_ack(spec.deferred_ack)
     }
 
     struct Mqtt5Client {
@@ -273,6 +324,14 @@ mod inprocess {
         options: ConnectOptions,
         authentication: Option<AuthSpec>,
         received: Arc<Mutex<Vec<ReceivedMessage>>>,
+        deferred: Arc<Mutex<Vec<AckToken>>>,
+    }
+
+    fn subscribe_options(value: u8) -> SubscribeOptions {
+        SubscribeOptions {
+            qos: qos(value),
+            ..SubscribeOptions::default()
+        }
     }
 
     impl Drop for Mqtt5Client {
@@ -323,6 +382,9 @@ mod inprocess {
                 retain: spec.retain,
                 properties: PublishProperties {
                     topic_alias: spec.topic_alias,
+                    response_topic: spec.response_topic,
+                    content_type: spec.content_type,
+                    subscription_identifiers: spec.subscription_identifiers,
                     ..PublishProperties::default()
                 },
                 ..PublishOptions::default()
@@ -336,13 +398,13 @@ mod inprocess {
             })
         }
 
-        fn subscribe(&self, filter: &str) -> ClientFuture<Result<(), ClientError>> {
+        fn subscribe(&self, filter: &str, qos: u8) -> ClientFuture<Result<(), ClientError>> {
             let client = self.client.clone();
             let filter = filter.to_owned();
             let received = Arc::clone(&self.received);
             Box::pin(async move {
                 client
-                    .subscribe(filter, move |message| {
+                    .subscribe_with_options(filter, subscribe_options(qos), move |message| {
                         received
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
@@ -355,6 +417,55 @@ mod inprocess {
                     .map(|_| ())
                     .map_err(|error| client_error(&error))
             })
+        }
+
+        fn subscribe_deferred(
+            &self,
+            filter: &str,
+            qos: u8,
+        ) -> ClientFuture<Result<(), ClientError>> {
+            let client = self.client.clone();
+            let filter = filter.to_owned();
+            let received = Arc::clone(&self.received);
+            let deferred = Arc::clone(&self.deferred);
+            Box::pin(async move {
+                client
+                    .subscribe_with_ack(filter, subscribe_options(qos), move |publish, token| {
+                        deferred
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(token);
+                        received
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(ReceivedMessage {
+                                topic: publish.topic_name.clone(),
+                                payload: publish.payload.to_vec(),
+                            });
+                    })
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| client_error(&error))
+            })
+        }
+
+        fn settle_deferred(&self, settle: Settle) -> usize {
+            let tokens: Vec<AckToken> = self
+                .deferred
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .drain(..)
+                .collect();
+            let settled = tokens.len();
+            for token in tokens {
+                match settle {
+                    Settle::Ack => token.ack(),
+                    Settle::Reject(reason) => token.reject(
+                        ReasonCode::from_u8(reason).unwrap_or(ReasonCode::UnspecifiedError),
+                    ),
+                }
+            }
+            settled
         }
 
         fn unsubscribe(&self, filter: &str) -> ClientFuture<Result<(), ClientError>> {
@@ -410,9 +521,12 @@ mod inprocess {
 
         fn capabilities(&self) -> ClientCapabilities {
             ClientCapabilities {
-                automatic_reconnect: true,
-                offline_queue: true,
-                enhanced_auth: true,
+                supported: &[
+                    ClientRequirement::AutomaticReconnect,
+                    ClientRequirement::OfflineQueue,
+                    ClientRequirement::EnhancedAuth,
+                    ClientRequirement::DeferredAck,
+                ],
             }
         }
 
@@ -423,6 +537,7 @@ mod inprocess {
                 options,
                 authentication: spec.authentication,
                 received: Arc::new(Mutex::new(Vec::new())),
+                deferred: Arc::new(Mutex::new(Vec::new())),
             })
         }
     }
