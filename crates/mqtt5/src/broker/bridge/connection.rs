@@ -49,10 +49,12 @@ struct IngressFilter {
 
 /// Connect options for the remote-facing client: a persistent deferred-ack session whose
 /// receive maximum equals the ingress lane, so the remote never sends more than the bridge
-/// can hold unacknowledged.
+/// can hold unacknowledged. The client does not reconnect by itself: the bridge's own loop
+/// does, with failover to the backup brokers and the subscriptions set up again.
 fn connect_options(config: &BridgeConfig) -> ConnectOptions {
     let receive_maximum = u16::try_from(INGRESS_LANE_CAPACITY).unwrap_or(u16::MAX);
     let mut options = ConnectOptions::new(&config.client_id)
+        .with_automatic_reconnect(false)
         .with_deferred_ack(true)
         .with_clean_start(false)
         .with_resume_existing_session(true)
@@ -1143,5 +1145,19 @@ impl BridgeConnection {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_remote_client_leaves_reconnecting_to_the_bridge() {
+        let options = connect_options(&BridgeConfig::new("remote", "127.0.0.1:1883"));
+        assert!(
+            !options.reconnect_config.enabled,
+            "the bridge's own loop reconnects, with failover to its backup brokers"
+        );
     }
 }
