@@ -245,3 +245,87 @@ async fn test_empty_backends_acts_as_normal_broker() {
     client.disconnect().await.unwrap();
     drop(broker);
 }
+
+/// A load balancer listening over TLS that redirects every client to
+/// `backend`, as the reference it is given says
+async fn tls_balancer(backend: String) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use mqtt5::broker::config::TlsConfig as BrokerTlsConfig;
+    use mqtt5::broker::MqttBroker;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certs = common::find_workspace_root().join("test_certs");
+    let config = lb_config(vec![backend]).with_tls(
+        BrokerTlsConfig::new(certs.join("server.pem"), certs.join("server.key"))
+            .with_require_client_cert(false)
+            .with_bind_address("127.0.0.1:0".parse::<SocketAddr>().unwrap()),
+    );
+    let mut balancer = MqttBroker::with_config(config).await.unwrap();
+    let address = balancer.tls_local_addr().expect("TLS listener bound");
+    let handle = tokio::spawn(async move {
+        let _ = balancer.run().await;
+    });
+    (address, handle)
+}
+
+#[tokio::test]
+async fn a_redirect_without_a_scheme_stays_on_tcp() {
+    let backend = TestBroker::start_with_config(backend_config()).await;
+    let reference = backend.address().strip_prefix("mqtt://").unwrap();
+    let lb = TestBroker::start_with_config(lb_config(vec![reference.to_string()])).await;
+    let client = MqttClient::new("redirect-stays-on-tcp");
+    client
+        .connect(lb.address())
+        .await
+        .expect("redirected over TCP to the backend");
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_redirect_without_a_scheme_keeps_tls() {
+    let backend = TestBroker::start_with_tls().await;
+    let reference = backend.address().strip_prefix("mqtts://").unwrap();
+    let (balancer, handle) = tls_balancer(reference.to_string()).await;
+    let client = MqttClient::new("redirect-keeps-tls");
+    client.set_insecure_tls(true).await;
+    client
+        .connect(&format!("mqtts://{balancer}"))
+        .await
+        .expect("redirected over TLS to the backend's TLS port");
+    client.disconnect().await.unwrap();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_redirect_without_a_scheme_keeps_tls_after_connect_with_tls() {
+    let backend = TestBroker::start_with_tls().await;
+    let reference = backend.address().strip_prefix("mqtts://").unwrap();
+    let (balancer, handle) = tls_balancer(reference.to_string()).await;
+    let client = MqttClient::new("redirect-keeps-tls-from-config");
+    client.set_insecure_tls(true).await;
+    client
+        .connect_with_tls(
+            mqtt5::transport::tls::TlsConfig::new(balancer, "localhost")
+                .with_verify_server_cert(false),
+        )
+        .await
+        .expect("redirected over TLS to the backend's TLS port");
+    client.disconnect().await.unwrap();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_redirect_from_tls_to_plain_tcp_is_refused() {
+    let backend = TestBroker::start_with_config(backend_config()).await;
+    let (balancer, handle) = tls_balancer(backend.address().to_string()).await;
+    let client = MqttClient::new("redirect-tls-to-tcp");
+    client.set_insecure_tls(true).await;
+    let error = client
+        .connect(&format!("mqtts://{balancer}"))
+        .await
+        .expect_err("a connection over TLS is not redirected to one without");
+    assert!(
+        error.to_string().contains("not over TLS"),
+        "refused for that reason: {error}"
+    );
+    assert!(!client.is_connected().await);
+    handle.abort();
+}

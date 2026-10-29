@@ -186,6 +186,34 @@ impl MqttClient {
         }
     }
 
+    /// The address a server's redirect (`UseAnotherServer`, `ServerMoved`)
+    /// sends a connection to `from` to. A reference with no scheme, as
+    /// `host:port` usually is, means TCP, made TLS (mqtts://) when `from` is
+    /// over TLS (mqtts://, wss://, quics://); and a connection over TLS is
+    /// not redirected to one without.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reference is not an address, or would take a
+    /// connection over TLS to one without
+    pub(crate) fn redirect_address(from: &str, to: &str) -> Result<String> {
+        let (from_transport, _, _) = Self::parse_address(from)?;
+        if !to.contains("://") {
+            return Ok(if from_transport.is_secure() {
+                format!("mqtts://{to}")
+            } else {
+                to.to_string()
+            });
+        }
+        let (to_transport, _, _) = Self::parse_address(to)?;
+        if from_transport.is_secure() && !to_transport.is_secure() {
+            return Err(MqttError::ConnectionError(format!(
+                "Server redirect to {to} refused: it is not over TLS, as the connection redirected was"
+            )));
+        }
+        Ok(to.to_string())
+    }
+
     /// Splits a host:port string
     ///
     /// # Errors
@@ -648,7 +676,7 @@ impl MqttClient {
                                 "Following server redirect"
                             );
                             redirect_count += 1;
-                            current_address = url;
+                            current_address = Self::redirect_address(&current_address, &url)?;
                             continue;
                         }
                     }
@@ -710,6 +738,7 @@ impl MqttClient {
                         reason = ?reason,
                         "Following server redirect from TLS connection"
                     );
+                    let url = Self::redirect_address("mqtts://", &url)?;
                     return Box::pin(self.connect_following_redirects(&url, 1)).await;
                 }
                 Err(MqttError::ConnectionError(
@@ -839,5 +868,57 @@ mod tests {
         assert!(!addrs.is_empty());
         assert!(addrs.iter().all(|addr| addr.port() == 1883));
         assert!(addrs.iter().all(|addr| addr.ip().is_loopback()));
+    }
+
+    #[test]
+    fn a_redirect_without_a_scheme_is_tcp_made_tls_from_a_secure_connection() {
+        assert_eq!(
+            MqttClient::redirect_address("mqtt://lb:1883", "backend:1883").unwrap(),
+            "backend:1883"
+        );
+        assert_eq!(
+            MqttClient::redirect_address("mqtts://lb:8883", "backend:8883").unwrap(),
+            "mqtts://backend:8883"
+        );
+        #[cfg(feature = "transport-websocket")]
+        {
+            assert_eq!(
+                MqttClient::redirect_address("ws://lb/mqtt", "backend:1883").unwrap(),
+                "backend:1883"
+            );
+            assert_eq!(
+                MqttClient::redirect_address("wss://lb/mqtt", "backend:8883").unwrap(),
+                "mqtts://backend:8883"
+            );
+        }
+        #[cfg(feature = "transport-quic")]
+        {
+            assert_eq!(
+                MqttClient::redirect_address("quic://lb:14567", "backend:1883").unwrap(),
+                "backend:1883"
+            );
+            assert_eq!(
+                MqttClient::redirect_address("quics://lb:14567", "backend:8883").unwrap(),
+                "mqtts://backend:8883"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redirect_from_a_secure_connection_to_a_plain_one_is_refused() {
+        for plain in ["mqtt://backend", "tcp://backend"] {
+            assert!(MqttClient::redirect_address("mqtts://lb", plain).is_err());
+        }
+        #[cfg(feature = "transport-websocket")]
+        {
+            assert!(MqttClient::redirect_address("wss://lb/mqtt", "ws://backend/mqtt").is_err());
+            assert!(MqttClient::redirect_address("mqtts://lb", "ws://backend/mqtt").is_err());
+        }
+        #[cfg(feature = "transport-quic")]
+        assert!(MqttClient::redirect_address("quics://lb", "quic://backend").is_err());
+        assert_eq!(
+            MqttClient::redirect_address("mqtt://lb", "mqtts://backend").unwrap(),
+            "mqtts://backend"
+        );
     }
 }

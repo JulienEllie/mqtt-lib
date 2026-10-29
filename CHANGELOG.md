@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking
+
+- **A server redirect from a connection over TLS keeps TLS.** A server reference without a scheme, the usual `host:port`, was followed over plain TCP whatever connection it redirected, so a client connected over mqtts://, wss:// or quics:// sent its CONNECT, credentials included, in the clear to the server named. A reference with mqtt://, ws:// or quic:// was followed the same way. A reference without a scheme now means TLS over TCP (mqtts://) when the connection redirected was over TLS, and plain TCP as before otherwise; a connection over TLS redirected to mqtt://, ws:// or quic:// fails. A load balancer that sends TLS clients to plain TCP backends without a scheme now needs its backends listed with their TLS addresses.
+
 ### Fixed
 
 - **A session removed for expiry takes its offline queue with it** (#273). With the file backend, a persistent session that expired while the broker was down was removed at the next start, but its queued messages stayed on disk and were loaded at every start, since the expiry sweep only visited clients with a stored session or a subscription. Queues left without any session, such as those of sessions removed earlier, were never visited either. The sweep now also visits every client that has queued messages, so the sweep that runs at start-up and every `cleanup_interval` removes the queue of any disconnected client with no live session, from memory and from disk. `StorageBackend` gains `queued_client_ids`, with a default that lists none. `Storage::get_session` also removes the queued messages of an expired cached session it drops.

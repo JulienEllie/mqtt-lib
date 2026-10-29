@@ -44,6 +44,19 @@ impl ClientTransportType {
         }
     }
 
+    /// Whether the connection verifies the server's certificate: mqtts://,
+    /// wss:// and quics://
+    pub(crate) fn is_secure(&self) -> bool {
+        match self {
+            Self::Tls => true,
+            #[cfg(feature = "transport-websocket")]
+            Self::WebSocketSecure(..) => true,
+            #[cfg(feature = "transport-quic")]
+            Self::QuicSecure => true,
+            _ => false,
+        }
+    }
+
     pub(crate) fn dials_by_url(&self) -> bool {
         match self {
             #[cfg(feature = "transport-websocket")]
