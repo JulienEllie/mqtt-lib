@@ -606,6 +606,11 @@ impl MqttClient {
             if let Some(ref certs) = existing_config.root_certs {
                 config = config.with_root_certs(certs.clone());
             }
+            // QuicConfig::with_root_certs leaves the system roots out, where
+            // TlsConfig's keeps them: over QUIC, a stored configuration's own
+            // roots are trusted alone. One with none takes the system roots
+            // away if it leaves them out itself.
+            config.use_system_roots &= existing_config.use_system_roots;
         } else {
             tracing::debug!("No stored TLS config for QUIC, using default");
         }
@@ -1093,5 +1098,23 @@ mod tests {
             "::1"
         );
         assert_eq!(client.quic_config(addr, "[::1]").await.0.server_name, "::1");
+    }
+
+    #[cfg(feature = "transport-quic")]
+    #[tokio::test]
+    async fn quics_takes_a_stored_tls_configs_system_roots() {
+        let client = MqttClient::new("quics-system-roots");
+        let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        client.tls_config.write().await.store(
+            crate::transport::tls::TlsConfig::new(addr, "localhost").with_system_roots(false),
+        );
+        assert!(
+            !client
+                .quic_secure_config(addr, "localhost")
+                .await
+                .0
+                .use_system_roots,
+            "a stored TLS configuration without system roots has none over QUIC either"
+        );
     }
 }
