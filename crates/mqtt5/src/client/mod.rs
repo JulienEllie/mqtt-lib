@@ -134,10 +134,26 @@ pub struct MqttClient {
     pub(crate) error_recovery_config: Arc<RwLock<error_recovery::ErrorRecoveryConfig>>,
     pub(crate) connection_mutex: Arc<tokio::sync::Mutex<()>>,
     pub(crate) monitor_wakeup: Arc<tokio::sync::Notify>,
-    pub(crate) tls_config: Arc<RwLock<Option<TlsConfig>>>,
+    pub(crate) tls_config: Arc<RwLock<StoredTlsConfig>>,
     pub(crate) transport_config: Arc<RwLock<crate::transport::ClientTransportConfig>>,
     #[cfg(feature = "transport-quic")]
-    pub(crate) quic_client_config: Arc<RwLock<Option<quinn::ClientConfig>>>,
+    pub(crate) quic_client_config: Arc<RwLock<Option<(inner::QuicBuiltFor, quinn::ClientConfig)>>>,
+}
+
+/// The TLS configuration stored for connections made from a URL, and how many
+/// times it has been stored: a QUIC configuration kept for early data is used
+/// again only with the one it was built from
+#[derive(Default)]
+pub(crate) struct StoredTlsConfig {
+    pub(crate) config: Option<TlsConfig>,
+    pub(crate) times_stored: u64,
+}
+
+impl StoredTlsConfig {
+    pub(crate) fn store(&mut self, config: TlsConfig) {
+        self.config = Some(config);
+        self.times_stored += 1;
+    }
 }
 
 impl MqttClient {

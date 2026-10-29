@@ -24,7 +24,47 @@ use super::state::ClientTransportType;
 use super::state::WebSocketSettings;
 use super::MqttClient;
 
+/// The TLS settings a QUIC connection's configuration was built from: the
+/// configuration kept for early data is used again only with the same ones,
+/// so that a quics:// connection is never made with one built for quic://,
+/// for insecure TLS or for another stored TLS configuration
+#[cfg(feature = "transport-quic")]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct QuicBuiltFor {
+    secure: bool,
+    insecure_tls: bool,
+    tls_config_times_stored: u64,
+}
+
+/// A connected transport, with what its configuration was built from if it is
+/// QUIC's
+struct Connected {
+    transport: TransportType,
+    #[cfg(feature = "transport-quic")]
+    quic_built_for: Option<QuicBuiltFor>,
+}
+
+impl From<TransportType> for Connected {
+    fn from(transport: TransportType) -> Self {
+        Self {
+            transport,
+            #[cfg(feature = "transport-quic")]
+            quic_built_for: None,
+        }
+    }
+}
+
 impl MqttClient {
+    /// The configuration kept for early data, if it was built for `built_for`
+    #[cfg(feature = "transport-quic")]
+    async fn kept_quic_client_config(
+        &self,
+        built_for: &QuicBuiltFor,
+    ) -> Option<quinn::ClientConfig> {
+        let (kept_for, config) = self.quic_client_config.read().await.clone()?;
+        (kept_for == *built_for).then_some(config)
+    }
+
     async fn on_successful_connect(
         &self,
         stored_subs: Vec<StoredSubscription>,
@@ -204,24 +244,25 @@ impl MqttClient {
         }
     }
 
-    pub(crate) async fn try_connect_address(
+    async fn try_connect_address(
         &self,
         addr: std::net::SocketAddr,
         client_transport_type: ClientTransportType,
         host: &str,
-    ) -> Result<TransportType> {
+    ) -> Result<Connected> {
         match client_transport_type {
-            ClientTransportType::Tcp => Self::connect_tcp(addr).await,
-            ClientTransportType::Tls => self.connect_tls(addr, host).await,
+            ClientTransportType::Tcp => Self::connect_tcp(addr).await.map(Connected::from),
+            ClientTransportType::Tls => self.connect_tls(addr, host).await.map(Connected::from),
             #[cfg(feature = "transport-websocket")]
-            ClientTransportType::WebSocket(url, settings) => {
-                self.connect_websocket(&url, settings).await
-            }
+            ClientTransportType::WebSocket(url, settings) => self
+                .connect_websocket(&url, settings)
+                .await
+                .map(Connected::from),
             #[cfg(feature = "transport-websocket")]
-            ClientTransportType::WebSocketSecure(url, settings) => {
-                self.connect_websocket_secure(addr, host, &url, settings)
-                    .await
-            }
+            ClientTransportType::WebSocketSecure(url, settings) => self
+                .connect_websocket_secure(addr, host, &url, settings)
+                .await
+                .map(Connected::from),
             #[cfg(feature = "transport-quic")]
             ClientTransportType::Quic => self.connect_quic(addr, host).await,
             #[cfg(feature = "transport-quic")]
@@ -242,7 +283,7 @@ impl MqttClient {
     async fn connect_tls(&self, addr: std::net::SocketAddr, host: &str) -> Result<TransportType> {
         let insecure = self.transport_config.read().await.insecure_tls;
         let tls_config_lock = self.tls_config.read().await;
-        let config = if let Some(existing_config) = &*tls_config_lock {
+        let config = if let Some(existing_config) = &tls_config_lock.config {
             tracing::debug!(
                 "Using stored TLS config - use_system_roots: {}, has_ca: {}, has_cert: {}",
                 existing_config.use_system_roots,
@@ -325,7 +366,7 @@ impl MqttClient {
         // The stored ALPN protocols are left out: they name the protocol for
         // MQTT directly over TLS (mqtts://, e.g. AWS IoT's x-amzn-mqtt-ca),
         // while a WebSocket server negotiates HTTP.
-        let stored = self.tls_config.read().await.clone();
+        let stored = self.tls_config.read().await.config.clone();
         let tls_config = match stored {
             Some(mut cfg) => {
                 cfg.addr = addr;
@@ -352,7 +393,24 @@ impl MqttClient {
     }
 
     #[cfg(feature = "transport-quic")]
-    async fn connect_quic(&self, addr: std::net::SocketAddr, host: &str) -> Result<TransportType> {
+    async fn connect_quic(&self, addr: std::net::SocketAddr, host: &str) -> Result<Connected> {
+        let (config, built_for) = self.quic_config(addr, host).await;
+        Self::open_quic(config, built_for).await
+    }
+
+    /// The configuration of a quic:// connection to `addr`, which verifies
+    /// nothing, so is built from none of the TLS settings
+    #[cfg(feature = "transport-quic")]
+    async fn quic_config(
+        &self,
+        addr: std::net::SocketAddr,
+        host: &str,
+    ) -> (QuicConfig, QuicBuiltFor) {
+        let built_for = QuicBuiltFor {
+            secure: false,
+            insecure_tls: true,
+            tls_config_times_stored: 0,
+        };
         let qc = self.transport_config.read().await;
         let server_name = if host.parse::<std::net::IpAddr>().is_ok() {
             "localhost"
@@ -370,18 +428,27 @@ impl MqttClient {
         if let Some(max) = qc.max_streams {
             config = config.with_max_concurrent_streams(max);
         }
-        if qc.enable_early_data {
-            if let Some(cached) = self.quic_client_config.read().await.clone() {
+        let enable_early_data = qc.enable_early_data;
+        drop(qc);
+        if enable_early_data {
+            if let Some(cached) = self.kept_quic_client_config(&built_for).await {
                 config = config.with_cached_client_config(cached);
             }
         }
-        drop(qc);
+        (config, built_for)
+    }
+
+    #[cfg(feature = "transport-quic")]
+    async fn open_quic(config: QuicConfig, built_for: QuicBuiltFor) -> Result<Connected> {
         let mut quic_transport = QuicTransport::new(config);
         quic_transport
             .connect()
             .await
             .map_err(|e| MqttError::ConnectionError(format!("QUIC connect failed: {e}")))?;
-        Ok(TransportType::Quic(Box::new(quic_transport)))
+        Ok(Connected {
+            transport: TransportType::Quic(Box::new(quic_transport)),
+            quic_built_for: Some(built_for),
+        })
     }
 
     #[cfg(feature = "transport-quic")]
@@ -389,7 +456,20 @@ impl MqttClient {
         &self,
         addr: std::net::SocketAddr,
         host: &str,
-    ) -> Result<TransportType> {
+    ) -> Result<Connected> {
+        let (config, built_for) = self.quic_secure_config(addr, host).await;
+        Self::open_quic(config, built_for).await
+    }
+
+    /// The configuration of a quics:// connection to `addr`, and what it was
+    /// built from: the client's transport settings and a stored TLS
+    /// configuration's certificates, each read once
+    #[cfg(feature = "transport-quic")]
+    async fn quic_secure_config(
+        &self,
+        addr: std::net::SocketAddr,
+        host: &str,
+    ) -> (QuicConfig, QuicBuiltFor) {
         let qc: crate::transport::ClientTransportConfig =
             (*self.transport_config.read().await).clone();
         let tls_config_lock = self.tls_config.read().await;
@@ -411,13 +491,7 @@ impl MqttClient {
             config = config.with_max_concurrent_streams(max);
         }
 
-        if qc.enable_early_data {
-            if let Some(cached) = self.quic_client_config.read().await.clone() {
-                config = config.with_cached_client_config(cached);
-            }
-        }
-
-        if let Some(existing_config) = &*tls_config_lock {
+        if let Some(existing_config) = &tls_config_lock.config {
             tracing::debug!(
                 "Using stored TLS config for QUIC - use_system_roots: {}, has_ca: {}, has_cert: {}",
                 existing_config.use_system_roots,
@@ -437,14 +511,19 @@ impl MqttClient {
         } else {
             tracing::debug!("No stored TLS config for QUIC, using default");
         }
+        let built_for = QuicBuiltFor {
+            secure: true,
+            insecure_tls: qc.insecure_tls,
+            tls_config_times_stored: tls_config_lock.times_stored,
+        };
         drop(tls_config_lock);
 
-        let mut quic_transport = QuicTransport::new(config);
-        quic_transport
-            .connect()
-            .await
-            .map_err(|e| MqttError::ConnectionError(format!("QUIC connect failed: {e}")))?;
-        Ok(TransportType::Quic(Box::new(quic_transport)))
+        if qc.enable_early_data {
+            if let Some(cached) = self.kept_quic_client_config(&built_for).await {
+                config = config.with_cached_client_config(cached);
+            }
+        }
+        (config, built_for)
     }
 
     pub(crate) async fn try_connect_to_addresses(
@@ -458,11 +537,11 @@ impl MqttClient {
         for addr in addresses {
             tracing::debug!("Trying to connect to address: {}", addr);
 
-            let transport = match self
+            let connected = match self
                 .try_connect_address(*addr, transport_type.clone(), host)
                 .await
             {
-                Ok(t) => t,
+                Ok(connected) => connected,
                 Err(e) => {
                     tracing::debug!("Failed to connect to {}: {}", addr, e);
                     last_error = Some(e);
@@ -473,11 +552,14 @@ impl MqttClient {
             self.reset_reconnect_counter().await;
 
             let mut inner = self.inner.write().await;
-            match inner.connect(transport).await {
+            match inner.connect(connected.transport).await {
                 Ok(result) => {
                     #[cfg(feature = "transport-quic")]
-                    if let Some(cached) = inner.cached_quic_client_config.take() {
-                        *self.quic_client_config.write().await = Some(cached);
+                    if let (Some(cached), Some(built_for)) = (
+                        inner.cached_quic_client_config.take(),
+                        connected.quic_built_for,
+                    ) {
+                        *self.quic_client_config.write().await = Some((built_for, cached));
                     }
                     let stored_subs = inner.stored_subscriptions.lock().clone();
                     let session_present = result.session_present;
@@ -589,7 +671,7 @@ impl MqttClient {
         &self,
         tls_config: crate::transport::tls::TlsConfig,
     ) -> Result<ConnectResult> {
-        *self.tls_config.write().await = Some(tls_config.clone());
+        self.tls_config.write().await.store(tls_config.clone());
 
         let mut tls_transport = crate::transport::tls::TlsTransport::new(tls_config);
         tls_transport

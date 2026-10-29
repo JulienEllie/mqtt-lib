@@ -59,7 +59,7 @@ impl MqttClient {
             error_recovery_config: Arc::new(RwLock::new(ErrorRecoveryConfig::default())),
             connection_mutex: Arc::new(tokio::sync::Mutex::new(())),
             monitor_wakeup: Arc::new(tokio::sync::Notify::new()),
-            tls_config: Arc::new(RwLock::new(None)),
+            tls_config: Arc::new(RwLock::new(super::StoredTlsConfig::default())),
             transport_config: Arc::new(RwLock::new(
                 crate::transport::ClientTransportConfig::default(),
             )),
@@ -118,6 +118,13 @@ impl MqttClient {
         self.transport_config.write().await.connect_timeout = timeout;
     }
 
+    /// Sets whether quics:// and quic:// connections use 0-RTT early data
+    ///
+    /// The QUIC configuration of a connection is then kept and used again,
+    /// with the TLS sessions it resumes, while the TLS settings it was built
+    /// from stay the same: quics:// or quic://, insecure TLS and the stored
+    /// TLS configuration. The QUIC settings it was built with (flow headers,
+    /// the stream limit, datagrams) stay with it until one of those changes.
     pub async fn set_quic_early_data(&self, enable: bool) {
         self.transport_config.write().await.enable_early_data = enable;
     }
@@ -167,7 +174,7 @@ impl MqttClient {
                 );
             }
 
-            *config_lock = Some(config);
+            config_lock.store(config);
             tracing::debug!("TLS config stored");
         }
     }
