@@ -796,27 +796,34 @@ impl MqttClient {
             return Err(MqttError::AlreadyConnected);
         }
 
-        {
+        let connect = {
             let mut inner = self.inner.write().await;
             inner
                 .auth_method
                 .clone_from(&options.properties.authentication_method);
             inner.options = options.clone();
             inner.reconnection = Some(Reconnection::Address(address.to_string()));
+            inner.connects += 1;
             inner.automatic_reconnect_lifecycle = AutomaticReconnectLifecycle::Armed;
-        }
+            inner.connects
+        };
 
         self.trigger_connection_event(ConnectionEvent::Connecting)
             .await;
         let result = self.connect_internal(address).await;
-        self.monitor_after_connect(&result, &options);
+        self.monitor_after_connect(&result, &options, connect);
         result
     }
 
-    /// Starts the task that reconnects when the connection is lost, if the
-    /// options ask for it, once a connection is made or has failed in a way
-    /// that a later attempt may not
-    fn monitor_after_connect(&self, result: &Result<ConnectResult>, options: &ConnectOptions) {
+    /// Starts the task that reconnects when the connection made by connect
+    /// number `connect` is lost, if the options ask for it, once it is made or
+    /// has failed in a way that a later attempt may not
+    fn monitor_after_connect(
+        &self,
+        result: &Result<ConnectResult>,
+        options: &ConnectOptions,
+        connect: u64,
+    ) {
         if let Err(ref error) = result {
             let error_recovery_config =
                 crate::client::error_recovery::ErrorRecoveryConfig::default();
@@ -830,7 +837,7 @@ impl MqttClient {
                     );
                     let client = self.clone();
                     tokio::spawn(async move {
-                        client.monitor_connection().await;
+                        client.monitor_connection(connect).await;
                     });
                 } else {
                     tracing::debug!(error = %error, "Initial connection failed with recoverable error, but automatic reconnection is disabled");
@@ -844,7 +851,7 @@ impl MqttClient {
             );
             let client = self.clone();
             tokio::spawn(async move {
-                client.monitor_connection().await;
+                client.monitor_connection(connect).await;
             });
         }
     }
@@ -863,17 +870,19 @@ impl MqttClient {
             return Err(MqttError::AlreadyConnected);
         }
 
-        {
+        let connect = {
             let mut inner = self.inner.write().await;
             inner.options = options.clone();
             inner.reconnection = Some(Reconnection::Tls(Box::new(tls_config.clone())));
+            inner.connects += 1;
             inner.automatic_reconnect_lifecycle = AutomaticReconnectLifecycle::Armed;
-        }
+            inner.connects
+        };
 
         self.trigger_connection_event(ConnectionEvent::Connecting)
             .await;
         let result = self.connect_internal_with_tls(tls_config).await;
-        self.monitor_after_connect(&result, &options);
+        self.monitor_after_connect(&result, &options, connect);
         result
     }
 }

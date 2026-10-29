@@ -194,12 +194,18 @@ impl MqttClient {
         Ok(())
     }
 
-    async fn is_reconnect_stopped(&self) -> bool {
+    /// Whether a reconnection started for connect number `connect` is to stop:
+    /// reconnection was stopped, or the client was asked to connect since
+    async fn is_reconnect_stopped(&self, connect: u64) -> bool {
         let inner = self.inner.read().await;
         inner.automatic_reconnect_lifecycle == AutomaticReconnectLifecycle::Stopped
+            || inner.connects != connect
     }
 
-    pub(crate) async fn monitor_connection(&self) {
+    /// Reconnects whenever the connection made by connect number `connect` is
+    /// lost, until reconnection is stopped or the client is asked to connect
+    /// again
+    pub(crate) async fn monitor_connection(&self, connect: u64) {
         tracing::info!("Starting connection monitor task");
 
         loop {
@@ -208,7 +214,7 @@ impl MqttClient {
                 () = self.monitor_wakeup.notified() => {}
             }
 
-            if self.is_reconnect_stopped().await {
+            if self.is_reconnect_stopped(connect).await {
                 tracing::info!("Reconnection disabled, exiting connection monitor");
                 break;
             }
@@ -235,7 +241,7 @@ impl MqttClient {
                     );
 
                     if let Err(e) = self
-                        .attempt_reconnection(&reconnection, &reconnect_config)
+                        .attempt_reconnection(&reconnection, &reconnect_config, connect)
                         .await
                     {
                         tracing::error!("Reconnection failed: {e}");
@@ -268,6 +274,7 @@ impl MqttClient {
         &self,
         reconnection: &Reconnection,
         config: &ReconnectConfig,
+        connect: u64,
     ) -> Result<()> {
         tracing::info!(
             address = %reconnection,
@@ -279,7 +286,7 @@ impl MqttClient {
         let mut delay = config.initial_delay;
 
         loop {
-            if self.is_reconnect_stopped().await {
+            if self.is_reconnect_stopped(connect).await {
                 tracing::info!("Automatic reconnect disabled, exiting reconnection loop");
                 return Ok(());
             }
@@ -322,7 +329,7 @@ impl MqttClient {
 
             let connection_guard = self.connection_mutex.lock().await;
 
-            if self.is_reconnect_stopped().await {
+            if self.is_reconnect_stopped(connect).await {
                 tracing::info!("Automatic reconnect disabled before attempt, exiting");
                 drop(connection_guard);
                 return Ok(());

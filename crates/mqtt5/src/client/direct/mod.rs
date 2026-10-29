@@ -240,6 +240,8 @@ pub struct DirectClientInner {
     pub pending_unsubacks: Arc<Mutex<HashMap<u16, oneshot::Sender<UnsubAckPacket>>>>,
     pub reconnect_attempt: u32,
     pub(crate) reconnection: Option<crate::client::state::Reconnection>,
+    /// Raised by each connect: a reconnection started for an earlier one stops
+    pub(crate) connects: u64,
     pub automatic_reconnect_lifecycle: AutomaticReconnectLifecycle,
     pub server_redirect: Option<String>,
     pub queued_messages: Arc<Mutex<OfflineQueue>>,
@@ -311,6 +313,7 @@ impl DirectClientInner {
             pending_unsubacks: Arc::new(Mutex::new(HashMap::new())),
             reconnect_attempt: 0,
             reconnection: None,
+            connects: 0,
             automatic_reconnect_lifecycle: AutomaticReconnectLifecycle::Armed,
             server_redirect: None,
             queued_messages: Arc::new(Mutex::new(OfflineQueue::default())),
