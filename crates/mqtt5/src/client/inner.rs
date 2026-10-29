@@ -54,6 +54,14 @@ impl From<TransportType> for Connected {
     }
 }
 
+/// The name the server's certificate is checked for: the host connected to,
+/// an IPv6 address without its brackets
+fn server_name(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|address| address.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 impl MqttClient {
     /// The configuration kept for early data, if it was built for `built_for`
     #[cfg(feature = "transport-quic")]
@@ -214,13 +222,31 @@ impl MqttClient {
         Ok(to.to_string())
     }
 
-    /// Splits a host:port string
+    /// Splits a host:port string, the host an IPv6 address in brackets
+    /// (`[::1]:8883`) included
     ///
     /// # Errors
     ///
     /// Returns an error if the port is invalid
     pub(crate) fn split_host_port(address: &str, default_port: u16) -> Result<(&str, u16)> {
         let address_without_path = address.split('/').next().unwrap_or(address);
+
+        if address_without_path.starts_with('[') {
+            let invalid =
+                || MqttError::ConnectionError(format!("Invalid address: {address_without_path}"));
+            let end = address_without_path.find(']').ok_or_else(invalid)?;
+            let (host, rest) = address_without_path.split_at(end + 1);
+            return match rest.strip_prefix(':') {
+                Some(port_str) => {
+                    let port = port_str.parse::<u16>().map_err(|_| {
+                        MqttError::ConnectionError(format!("Invalid port: {port_str}"))
+                    })?;
+                    Ok((host, port))
+                }
+                None if rest.is_empty() => Ok((host, default_port)),
+                None => Err(invalid()),
+            };
+        }
 
         if let Some(colon_pos) = address_without_path.rfind(':') {
             let host = &address_without_path[..colon_pos];
@@ -287,7 +313,7 @@ impl MqttClient {
                 Some(given) => {
                     let mut config = given.clone();
                     config.addr = addr;
-                    config.hostname = host.to_string();
+                    config.hostname = server_name(host).to_string();
                     Self::open_tls(config).await.map(Connected::from)
                 }
                 None => self.connect_tls(addr, host).await.map(Connected::from),
@@ -320,9 +346,16 @@ impl MqttClient {
     }
 
     async fn connect_tls(&self, addr: std::net::SocketAddr, host: &str) -> Result<TransportType> {
+        let config = self.tls_config_for(addr, host).await;
+        Self::open_tls(config).await
+    }
+
+    /// The configuration of an mqtts:// connection to `addr`: the stored TLS
+    /// configuration, or a default one
+    async fn tls_config_for(&self, addr: std::net::SocketAddr, host: &str) -> TlsConfig {
         let insecure = self.transport_config.read().await.insecure_tls;
         let tls_config_lock = self.tls_config.read().await;
-        let config = if let Some(existing_config) = &tls_config_lock.config {
+        if let Some(existing_config) = &tls_config_lock.config {
             tracing::debug!(
                 "Using stored TLS config - use_system_roots: {}, has_ca: {}, has_cert: {}",
                 existing_config.use_system_roots,
@@ -331,15 +364,13 @@ impl MqttClient {
             );
             let mut cfg = existing_config.clone();
             cfg.addr = addr;
-            cfg.hostname = host.to_string();
+            cfg.hostname = server_name(host).to_string();
             cfg.verify_server_cert = !insecure;
             cfg
         } else {
             tracing::debug!("No stored TLS config, using default");
-            TlsConfig::new(addr, host).with_verify_server_cert(!insecure)
-        };
-        drop(tls_config_lock);
-        Self::open_tls(config).await
+            TlsConfig::new(addr, server_name(host)).with_verify_server_cert(!insecure)
+        }
     }
 
     async fn open_tls(config: TlsConfig) -> Result<TransportType> {
@@ -487,7 +518,7 @@ impl MqttClient {
             tls_config_times_stored: 0,
         };
         let qc = self.transport_config.read().await;
-        let mut config = QuicConfig::new(addr, host)
+        let mut config = QuicConfig::new(addr, server_name(host))
             .with_verify_server_cert(false)
             .with_stream_strategy(qc.stream_strategy)
             .with_flow_headers(qc.flow_headers)
@@ -545,7 +576,7 @@ impl MqttClient {
         let tls_config_lock = self.tls_config.read().await;
         // As over TLS, the certificate is checked for the host connected to,
         // an IP address included.
-        let mut config = QuicConfig::new(addr, host)
+        let mut config = QuicConfig::new(addr, server_name(host))
             .with_verify_server_cert(!qc.insecure_tls)
             .with_stream_strategy(qc.stream_strategy)
             .with_flow_headers(qc.flow_headers)
@@ -704,7 +735,22 @@ impl MqttClient {
                     port,
                 )]
             } else {
-                Self::resolve_addresses(host, port).await?
+                let addrs = Self::resolve_addresses(host, port).await?;
+                // A QUIC server gives no answer on an address it does not
+                // listen on, so each such address costs the connect timeout:
+                // a name's IPv4 addresses are tried before its IPv6 ones.
+                #[cfg(feature = "transport-quic")]
+                let addrs = if matches!(
+                    client_transport_type,
+                    ClientTransportType::Quic | ClientTransportType::QuicSecure
+                ) {
+                    let mut addrs = addrs;
+                    addrs.sort_by_key(std::net::SocketAddr::is_ipv6);
+                    addrs
+                } else {
+                    addrs
+                };
+                addrs
             };
             let addresses_to_try = Self::select_addresses_for_connection(&addrs, host);
 
@@ -1012,5 +1058,40 @@ mod tests {
             "127.0.0.1",
             "quic:// names an IP address as quics:// does, though it verifies nothing"
         );
+    }
+
+    #[test]
+    fn an_ipv6_address_is_split_from_its_port() {
+        assert_eq!(
+            MqttClient::split_host_port("[::1]:8883", 1883).unwrap(),
+            ("[::1]", 8883)
+        );
+        assert_eq!(
+            MqttClient::split_host_port("[::1]", 8883).unwrap(),
+            ("[::1]", 8883)
+        );
+        assert_eq!(
+            MqttClient::split_host_port("[::1]/mqtt", 443).unwrap(),
+            ("[::1]", 443)
+        );
+    }
+
+    #[tokio::test]
+    async fn mqtts_to_an_ipv6_address_is_checked_for_it() {
+        let client = MqttClient::new("mqtts-ipv6");
+        let addr = "[::1]:8883".parse().unwrap();
+        assert_eq!(client.tls_config_for(addr, "[::1]").await.hostname, "::1");
+    }
+
+    #[cfg(feature = "transport-quic")]
+    #[tokio::test]
+    async fn quic_names_an_ipv6_address_without_its_brackets() {
+        let client = MqttClient::new("quic-ipv6-names");
+        let addr = "[::1]:14567".parse().unwrap();
+        assert_eq!(
+            client.quic_secure_config(addr, "[::1]").await.0.server_name,
+            "::1"
+        );
+        assert_eq!(client.quic_config(addr, "[::1]").await.0.server_name, "::1");
     }
 }

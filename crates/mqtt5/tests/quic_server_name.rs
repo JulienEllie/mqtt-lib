@@ -2,12 +2,13 @@
 //! connects to, an IP address included, as mqtts:// does.
 #![cfg(all(feature = "broker", feature = "transport-quic"))]
 
+mod common;
+
 use mqtt5::broker::config::{
     BrokerConfig, QuicConfig as BrokerQuicConfig, StorageBackend, StorageConfig,
 };
 use mqtt5::broker::MqttBroker;
 use mqtt5::MqttClient;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -17,19 +18,7 @@ async fn broker_for_localhost_alone(
     dir: &Path,
 ) -> (Vec<u8>, SocketAddr, tokio::task::JoinHandle<()>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let ca_key = KeyPair::generate().unwrap();
-    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = ca_params.self_signed(&ca_key).unwrap();
-    let issuer = Issuer::new(ca_params, ca_key);
-    let key = KeyPair::generate().unwrap();
-    let certificate = CertificateParams::new(vec!["localhost".to_string()])
-        .unwrap()
-        .signed_by(&key, &issuer)
-        .unwrap();
-    std::fs::write(dir.join("server.pem"), certificate.pem()).unwrap();
-    std::fs::write(dir.join("server.key"), key.serialize_pem()).unwrap();
-
+    let ca = common::certificate_for(dir, &["localhost"]);
     let config = BrokerConfig::default()
         .with_storage(StorageConfig::default().with_backend(StorageBackend::Memory))
         .with_bind_address(([127, 0, 0, 1], 0))
@@ -44,7 +33,7 @@ async fn broker_for_localhost_alone(
     let handle = tokio::spawn(async move {
         let _ = broker.run().await;
     });
-    (ca.pem().into_bytes(), addr, handle)
+    (ca, addr, handle)
 }
 
 #[tokio::test]

@@ -346,6 +346,27 @@ pub fn test_ca() -> Vec<u8> {
     std::fs::read(find_workspace_root().join("test_certs/ca.pem")).unwrap()
 }
 
+/// Makes a CA and a server certificate it signs for `names`, written to
+/// `server.pem` and `server.key` in `dir`; returns the CA in PEM
+#[allow(dead_code)]
+pub fn certificate_for(dir: &std::path::Path, names: &[&str]) -> Vec<u8> {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, ca_key);
+    let key = KeyPair::generate().unwrap();
+    let names: Vec<String> = names.iter().map(ToString::to_string).collect();
+    let certificate = CertificateParams::new(names)
+        .unwrap()
+        .signed_by(&key, &issuer)
+        .unwrap();
+    std::fs::write(dir.join("server.pem"), certificate.pem()).unwrap();
+    std::fs::write(dir.join("server.key"), key.serialize_pem()).unwrap();
+    ca.pem().into_bytes()
+}
+
 /// A CA that signs no test broker's certificate
 #[allow(dead_code)]
 pub fn other_ca() -> Vec<u8> {
