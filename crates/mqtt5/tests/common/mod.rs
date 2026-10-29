@@ -315,6 +315,47 @@ impl Drop for TestBroker {
     }
 }
 
+/// Forwards each connection to `to`, and drops every one open when `cut` is
+/// notified, while still taking new ones
+#[allow(dead_code)]
+pub async fn cutting_proxy(to: SocketAddr) -> (SocketAddr, std::sync::Arc<tokio::sync::Notify>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cut = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cuts = cut.clone();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let Ok(mut server) = tokio::net::TcpStream::connect(to).await else {
+                return;
+            };
+            let cuts = cuts.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {}
+                    () = cuts.notified() => {}
+                }
+            });
+        }
+    });
+    (addr, cut)
+}
+
+/// The test CA, which signs the test brokers' certificates
+#[allow(dead_code)]
+pub fn test_ca() -> Vec<u8> {
+    std::fs::read(find_workspace_root().join("test_certs/ca.pem")).unwrap()
+}
+
+/// A CA that signs no test broker's certificate
+#[allow(dead_code)]
+pub fn other_ca() -> Vec<u8> {
+    rcgen::generate_simple_self_signed(vec!["other-ca".to_string()])
+        .unwrap()
+        .cert
+        .pem()
+        .into_bytes()
+}
+
 /// Default timeout for test operations
 #[allow(dead_code)]
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);

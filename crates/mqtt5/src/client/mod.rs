@@ -316,6 +316,12 @@ impl MqttClient {
 
     /// Connects to the MQTT broker using a custom TLS configuration
     ///
+    /// Automatic reconnections connect with the same configuration, unless
+    /// the options turn them off
+    /// ([`ConnectOptions::with_automatic_reconnect`]). A server redirect is
+    /// followed with it too, to an mqtts:// address only. It is also stored
+    /// for later connections made from a URL, as with `set_tls_config`.
+    ///
     /// # Errors
     ///
     /// Returns an error if connection fails or TLS configuration is invalid
@@ -334,7 +340,8 @@ impl MqttClient {
 
     /// Connects to the MQTT broker using custom TLS configuration and connect options
     ///
-    /// Returns `session_present` flag from CONNACK
+    /// Returns `session_present` flag from CONNACK. The configuration is used
+    /// as with [`connect_with_tls`](Self::connect_with_tls).
     ///
     /// # Errors
     ///

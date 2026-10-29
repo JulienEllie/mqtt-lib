@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::find_workspace_root;
+use common::{find_workspace_root, other_ca, test_ca};
 use mqtt5::broker::config::{
     BrokerConfig, QuicConfig as BrokerQuicConfig, StorageBackend, StorageConfig,
 };
@@ -34,10 +34,6 @@ async fn start_quic_broker() -> (tokio::task::JoinHandle<()>, SocketAddr) {
         let _ = broker.run().await;
     });
     (handle, addr)
-}
-
-fn test_ca() -> Vec<u8> {
-    std::fs::read(find_workspace_root().join("test_certs/ca.pem")).unwrap()
 }
 
 #[tokio::test]
@@ -87,13 +83,7 @@ async fn quics_takes_a_new_stored_tls_config() {
         .await
         .expect("trusted by the stored configuration's CA");
     client.disconnect().await.unwrap();
-    let other_ca = rcgen::generate_simple_self_signed(vec!["other-ca".to_string()])
-        .unwrap()
-        .cert
-        .pem();
-    client
-        .set_tls_config(None, None, Some(other_ca.into_bytes()))
-        .await;
+    client.set_tls_config(None, None, Some(other_ca())).await;
     client
         .connect(&format!("quics://{addr}"))
         .await

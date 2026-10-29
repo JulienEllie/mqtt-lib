@@ -329,3 +329,75 @@ async fn a_redirect_from_tls_to_plain_tcp_is_refused() {
     assert!(!client.is_connected().await);
     handle.abort();
 }
+
+#[tokio::test]
+async fn connect_with_tls_follows_a_redirect_with_its_configuration() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let backend = TestBroker::start_with_tls().await;
+    let (backend_proxy, cut) = common::cutting_proxy(
+        backend
+            .address()
+            .strip_prefix("mqtts://")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .await;
+    let (balancer, handle) = tls_balancer(backend_proxy.to_string()).await;
+    let client = MqttClient::with_options(
+        mqtt5::ConnectOptions::new("redirect-with-its-configuration")
+            .with_reconnect_delay(Duration::from_millis(100), Duration::from_millis(200)),
+    );
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = connections.clone();
+    client
+        .on_connection_event(move |event| {
+            if matches!(event, mqtt5::ConnectionEvent::Connected { .. }) {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await
+        .unwrap();
+    let mut config =
+        mqtt5::transport::tls::TlsConfig::new(balancer, "localhost").with_system_roots(false);
+    config.load_ca_cert_pem_bytes(&common::test_ca()).unwrap();
+    client
+        .connect_with_tls(config)
+        .await
+        .expect("redirected to the backend, trusting the CA given");
+    // A TLS configuration stored since is for connections made from a URL:
+    // the reconnection, redirected again, still trusts the CA it was given.
+    client
+        .set_tls_config(None, None, Some(common::other_ca()))
+        .await;
+    cut.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while connections.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reconnected through the balancer to the backend");
+    client.disconnect().await.unwrap();
+    handle.abort();
+}
+
+#[cfg(feature = "transport-quic")]
+#[tokio::test]
+async fn connect_with_tls_is_redirected_only_over_tls() {
+    let (balancer, handle) = tls_balancer("quics://127.0.0.1:14567".to_string()).await;
+    let client = MqttClient::new("redirect-with-tls-to-quic");
+    let error = client
+        .connect_with_tls(
+            mqtt5::transport::tls::TlsConfig::new(balancer, "localhost")
+                .with_verify_server_cert(false),
+        )
+        .await
+        .expect_err("its configuration is for TLS over TCP");
+    assert!(
+        error.to_string().contains("only redirected to mqtts://"),
+        "refused for that reason: {error}"
+    );
+    handle.abort();
+}

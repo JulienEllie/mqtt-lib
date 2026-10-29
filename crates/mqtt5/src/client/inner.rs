@@ -19,9 +19,9 @@ use crate::transport::{TcpTransport, TlsTransport, TransportType};
 
 use super::connection::ConnectionEvent;
 use super::direct::{AutomaticReconnectLifecycle, StoredSubscription};
-use super::state::ClientTransportType;
 #[cfg(feature = "transport-websocket")]
 use super::state::WebSocketSettings;
+use super::state::{ClientTransportType, Reconnection};
 use super::MqttClient;
 
 /// The TLS settings a QUIC connection's configuration was built from: the
@@ -272,15 +272,26 @@ impl MqttClient {
         }
     }
 
+    /// Connects to `addr`, over TLS with `given_tls` if a connection made with
+    /// `connect_with_tls` is redirected
     async fn try_connect_address(
         &self,
         addr: std::net::SocketAddr,
         client_transport_type: ClientTransportType,
         host: &str,
+        given_tls: Option<&TlsConfig>,
     ) -> Result<Connected> {
         match client_transport_type {
             ClientTransportType::Tcp => Self::connect_tcp(addr).await.map(Connected::from),
-            ClientTransportType::Tls => self.connect_tls(addr, host).await.map(Connected::from),
+            ClientTransportType::Tls => match given_tls {
+                Some(given) => {
+                    let mut config = given.clone();
+                    config.addr = addr;
+                    config.hostname = host.to_string();
+                    Self::open_tls(config).await.map(Connected::from)
+                }
+                None => self.connect_tls(addr, host).await.map(Connected::from),
+            },
             #[cfg(feature = "transport-websocket")]
             ClientTransportType::WebSocket(url, settings) => self
                 .connect_websocket(&url, settings)
@@ -328,7 +339,10 @@ impl MqttClient {
             TlsConfig::new(addr, host).with_verify_server_cert(!insecure)
         };
         drop(tls_config_lock);
+        Self::open_tls(config).await
+    }
 
+    async fn open_tls(config: TlsConfig) -> Result<TransportType> {
         let mut tls_transport = TlsTransport::new(config);
         tls_transport
             .connect()
@@ -559,6 +573,7 @@ impl MqttClient {
         addresses: &[std::net::SocketAddr],
         transport_type: ClientTransportType,
         host: &str,
+        given_tls: Option<&TlsConfig>,
     ) -> Result<ConnectResult> {
         let mut last_error = None;
 
@@ -566,7 +581,7 @@ impl MqttClient {
             tracing::debug!("Trying to connect to address: {}", addr);
 
             let connected = match self
-                .try_connect_address(*addr, transport_type.clone(), host)
+                .try_connect_address(*addr, transport_type.clone(), host, given_tls)
                 .await
             {
                 Ok(connected) => connected,
@@ -620,13 +635,17 @@ impl MqttClient {
     }
 
     pub(crate) async fn connect_internal(&self, address: &str) -> Result<ConnectResult> {
-        Box::pin(self.connect_following_redirects(address, 0)).await
+        Box::pin(self.connect_following_redirects(address, 0, None)).await
     }
 
+    /// Connects to `address`, following the server's redirects. A connection
+    /// made with `connect_with_tls` is redirected with its TLS configuration,
+    /// `given_tls`, which is for TLS over TCP alone.
     async fn connect_following_redirects(
         &self,
         address: &str,
         redirects_followed: u8,
+        given_tls: Option<&TlsConfig>,
     ) -> Result<ConnectResult> {
         const MAX_REDIRECTS: u8 = 3;
         self.inner.read().await.options.validate_deferred_ack()?;
@@ -643,6 +662,12 @@ impl MqttClient {
             );
 
             let (requested_transport_type, host, port) = Self::parse_address(&current_address)?;
+            if given_tls.is_some() && !matches!(requested_transport_type, ClientTransportType::Tls)
+            {
+                return Err(MqttError::ConnectionError(format!(
+                    "Server redirect to {current_address} refused: a connection made with connect_with_tls is only redirected to mqtts://, which its TLS configuration is for"
+                )));
+            }
             let client_transport_type = if redirect_count == 0 {
                 requested_transport_type
             } else {
@@ -659,7 +684,7 @@ impl MqttClient {
             let addresses_to_try = Self::select_addresses_for_connection(&addrs, host);
 
             match self
-                .try_connect_to_addresses(addresses_to_try, client_transport_type, host)
+                .try_connect_to_addresses(addresses_to_try, client_transport_type, host, given_tls)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -690,24 +715,32 @@ impl MqttClient {
         }
     }
 
-    /// Internal connection method using custom TLS configuration
+    /// Internal connection method using custom TLS configuration: it is
+    /// stored for later connections made from a URL, as `set_tls_config`
+    /// does
     ///
     /// # Errors
     ///
     /// Returns an error if TLS connection fails
     pub(crate) async fn connect_internal_with_tls(
         &self,
-        tls_config: crate::transport::tls::TlsConfig,
+        tls_config: TlsConfig,
     ) -> Result<ConnectResult> {
         self.tls_config.write().await.store(tls_config.clone());
+        self.connect_with_tls_config(tls_config).await
+    }
 
-        let mut tls_transport = crate::transport::tls::TlsTransport::new(tls_config);
-        tls_transport
-            .connect()
-            .await
-            .map_err(|e| MqttError::ConnectionError(format!("TLS connect failed: {e}")))?;
-
-        let transport = TransportType::Tls(Box::new(tls_transport));
+    /// Connects with `tls_config` as it is given, as `connect_with_tls` and
+    /// its reconnections do, and follows a redirect with it
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS connection fails
+    pub(crate) async fn connect_with_tls_config(
+        &self,
+        tls_config: TlsConfig,
+    ) -> Result<ConnectResult> {
+        let transport = Self::open_tls(tls_config.clone()).await?;
 
         {
             let mut inner = self.inner.write().await;
@@ -739,7 +772,8 @@ impl MqttClient {
                         "Following server redirect from TLS connection"
                     );
                     let url = Self::redirect_address("mqtts://", &url)?;
-                    return Box::pin(self.connect_following_redirects(&url, 1)).await;
+                    return Box::pin(self.connect_following_redirects(&url, 1, Some(&tls_config)))
+                        .await;
                 }
                 Err(MqttError::ConnectionError(
                     "Server redirect missing server reference".to_string(),
@@ -768,14 +802,21 @@ impl MqttClient {
                 .auth_method
                 .clone_from(&options.properties.authentication_method);
             inner.options = options.clone();
-            inner.last_address = Some(address.to_string());
+            inner.reconnection = Some(Reconnection::Address(address.to_string()));
             inner.automatic_reconnect_lifecycle = AutomaticReconnectLifecycle::Armed;
         }
 
         self.trigger_connection_event(ConnectionEvent::Connecting)
             .await;
         let result = self.connect_internal(address).await;
+        self.monitor_after_connect(&result, &options);
+        result
+    }
 
+    /// Starts the task that reconnects when the connection is lost, if the
+    /// options ask for it, once a connection is made or has failed in a way
+    /// that a later attempt may not
+    fn monitor_after_connect(&self, result: &Result<ConnectResult>, options: &ConnectOptions) {
         if let Err(ref error) = result {
             let error_recovery_config =
                 crate::client::error_recovery::ErrorRecoveryConfig::default();
@@ -806,8 +847,6 @@ impl MqttClient {
                 client.monitor_connection().await;
             });
         }
-
-        result
     }
 
     /// Internal TLS connection method (no mutex guard)
@@ -817,7 +856,7 @@ impl MqttClient {
     /// Returns an error if connection fails or configuration is invalid
     pub(crate) async fn connect_with_tls_and_options_internal(
         &self,
-        tls_config: crate::transport::tls::TlsConfig,
+        tls_config: TlsConfig,
         options: ConnectOptions,
     ) -> Result<ConnectResult> {
         if self.is_connected().await {
@@ -827,22 +866,14 @@ impl MqttClient {
         {
             let mut inner = self.inner.write().await;
             inner.options = options.clone();
-            inner.last_address = Some(format!(
-                "{}:{}",
-                tls_config.hostname,
-                tls_config.addr.port()
-            ));
+            inner.reconnection = Some(Reconnection::Tls(Box::new(tls_config.clone())));
             inner.automatic_reconnect_lifecycle = AutomaticReconnectLifecycle::Armed;
         }
 
         self.trigger_connection_event(ConnectionEvent::Connecting)
             .await;
         let result = self.connect_internal_with_tls(tls_config).await;
-
-        if result.is_err() && options.reconnect_config.enabled {
-            tracing::warn!("Automatic reconnection with custom TLS config is not yet supported");
-        }
-
+        self.monitor_after_connect(&result, &options);
         result
     }
 }

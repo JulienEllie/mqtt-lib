@@ -11,12 +11,31 @@ use super::connection::{ConnectionEvent, ReconnectConfig};
 use super::direct::AutomaticReconnectLifecycle;
 use super::direct::{StoredSubscription, SubscriptionPersistence};
 use super::MqttClient;
+use crate::transport::tls::TlsConfig;
 
 #[cfg(feature = "transport-websocket")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WebSocketSettings {
     Configured,
     Default,
+}
+
+/// What an automatic reconnection connects to
+#[derive(Clone)]
+pub(crate) enum Reconnection {
+    /// The address given to `connect`
+    Address(String),
+    /// The TLS configuration given to `connect_with_tls`, used as it was given
+    Tls(Box<TlsConfig>),
+}
+
+impl std::fmt::Display for Reconnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Address(address) => f.write_str(address),
+            Self::Tls(config) => write!(f, "{} ({}) over TLS", config.addr, config.hostname),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +220,7 @@ impl MqttClient {
                 );
 
                 let reconnect_config = inner.options.reconnect_config.clone();
-                let last_address = inner.last_address.clone();
+                let reconnection = inner.reconnection.clone();
                 drop(inner);
 
                 if !reconnect_config.enabled {
@@ -209,13 +228,16 @@ impl MqttClient {
                     break;
                 }
 
-                if let Some(address) = last_address {
+                if let Some(reconnection) = reconnection {
                     tracing::info!(
-                        address = %address,
+                        address = %reconnection,
                         "Starting reconnection attempt"
                     );
 
-                    if let Err(e) = self.attempt_reconnection(&address, &reconnect_config).await {
+                    if let Err(e) = self
+                        .attempt_reconnection(&reconnection, &reconnect_config)
+                        .await
+                    {
                         tracing::error!("Reconnection failed: {e}");
                         self.trigger_connection_event(ConnectionEvent::ReconnectFailed {
                             error: e,
@@ -244,11 +266,11 @@ impl MqttClient {
     /// Returns an error if max reconnection attempts exceeded
     pub(crate) async fn attempt_reconnection(
         &self,
-        address: &str,
+        reconnection: &Reconnection,
         config: &ReconnectConfig,
     ) -> Result<()> {
         tracing::info!(
-            address = %address,
+            address = %reconnection,
             max_attempts = ?config.max_attempts,
             initial_delay = ?config.initial_delay,
             "Starting reconnection loop"
@@ -313,10 +335,16 @@ impl MqttClient {
 
             tracing::info!(
                 attempt = attempt,
-                address = %address,
-                "Making connection attempt #{} to {}", attempt, address
+                address = %reconnection,
+                "Making connection attempt #{} to {}", attempt, reconnection
             );
-            let reconnection_result = self.connect_internal(address).await;
+            let reconnection_result = match reconnection {
+                Reconnection::Address(address) => self.connect_internal(address).await,
+                Reconnection::Tls(tls_config) => {
+                    self.connect_with_tls_config(TlsConfig::clone(tls_config))
+                        .await
+                }
+            };
 
             drop(connection_guard);
 
