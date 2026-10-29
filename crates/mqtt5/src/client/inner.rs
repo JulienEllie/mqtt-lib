@@ -487,12 +487,7 @@ impl MqttClient {
             tls_config_times_stored: 0,
         };
         let qc = self.transport_config.read().await;
-        let server_name = if host.parse::<std::net::IpAddr>().is_ok() {
-            "localhost"
-        } else {
-            host
-        };
-        let mut config = QuicConfig::new(addr, server_name)
+        let mut config = QuicConfig::new(addr, host)
             .with_verify_server_cert(false)
             .with_stream_strategy(qc.stream_strategy)
             .with_flow_headers(qc.flow_headers)
@@ -548,12 +543,9 @@ impl MqttClient {
         let qc: crate::transport::ClientTransportConfig =
             (*self.transport_config.read().await).clone();
         let tls_config_lock = self.tls_config.read().await;
-        let server_name = if host.parse::<std::net::IpAddr>().is_ok() {
-            "localhost"
-        } else {
-            host
-        };
-        let mut config = QuicConfig::new(addr, server_name)
+        // As over TLS, the certificate is checked for the host connected to,
+        // an IP address included.
+        let mut config = QuicConfig::new(addr, host)
             .with_verify_server_cert(!qc.insecure_tls)
             .with_stream_strategy(qc.stream_strategy)
             .with_flow_headers(qc.flow_headers)
@@ -999,6 +991,26 @@ mod tests {
         assert_eq!(
             MqttClient::redirect_address("mqtt://lb", "mqtts://backend").unwrap(),
             "mqtts://backend"
+        );
+    }
+
+    #[cfg(feature = "transport-quic")]
+    #[tokio::test]
+    async fn quic_names_the_address_connected_to() {
+        let client = MqttClient::new("quic-ip-names");
+        let addr = "127.0.0.1:14567".parse().unwrap();
+        assert_eq!(
+            client
+                .quic_secure_config(addr, "127.0.0.1")
+                .await
+                .0
+                .server_name,
+            "127.0.0.1"
+        );
+        assert_eq!(
+            client.quic_config(addr, "127.0.0.1").await.0.server_name,
+            "127.0.0.1",
+            "quic:// names an IP address as quics:// does, though it verifies nothing"
         );
     }
 }
